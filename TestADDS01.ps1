@@ -2,6 +2,7 @@
   Validação AD – RPC/DCOM + Leitura Remota de Logs + DCDIAG + WMI/CIM + (opcional) PortQry
   Saídas: CSV e HTML na Área de Trabalho do usuário atual
   Criado por Eduardo Popovici
+  Deve-se instalar o PortQry para que os testes funcionem corretamente
 #>
 
 $ErrorActionPreference = 'Stop'
