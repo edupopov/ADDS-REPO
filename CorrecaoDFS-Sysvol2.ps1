@@ -1,21 +1,20 @@
 <#
-  Fix SYSVOL (DFSR) – Item A – Fechar sincronização (v3)
+  Fix SYSVOL (DFSR) – Item A v3.1
+  - Pré-reparo da 5722 (firewall/serviço) Source/Targets
+  - Recria membership/conexão do Target se a 5722 seguir fechada
+  - Só então entra no loop do backlog (PT/EN) com progresso
+  - Gera CSV + HTML na Desktop
   Criado por Eduardo Popovici
-
-  Melhorias:
-   - Parsing do backlog PT/EN (Backlog File Count | Contagem ... arquivos).
-   - Progresso a cada 10s com contagem regressiva.
-   - Execução local quando o alvo = máquina atual (sem remoting).
 #>
 
 $ErrorActionPreference = 'Stop'
 
 # ===== Parâmetros =====
-$SourceDC        = 'SRV-AD-02'                      # DC saudável (fonte)
-$Targets         = @('SRV-AD-01','FIX-DC00')        # DC(s) a corrigir
+$SourceDC        = 'SRV-AD-02'
+$Targets         = @('SRV-AD-01')          # adicione 'FIX-DC00' se desejar
 $RGName          = 'Domain System Volume'
 $RFFolder        = 'SYSVOL Share'
-$TimeoutMinutes  = 20
+$TimeoutMinutes  = 25
 
 # ===== Saídas =====
 $ts      = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -44,49 +43,90 @@ function Escape-Html([string]$t){
   return $t
 }
 
-# Execução local dos passos do alvo
-$targetScript = {
-  param($RGName,$RFFolder)
-  $ErrorActionPreference = 'Stop'
-  $ns = 'root\microsoftdfs'
-  $out = New-Object System.Collections.Generic.List[string]
-
-  $svc = Get-Service DFSR -ErrorAction Stop
-  $out.Add(("DFSR Service: {0} (StartType={1})" -f $svc.Status,$svc.StartType))
-
-  try {
-    $ev9061 = Get-WinEvent -FilterHashtable @{LogName='DFS Replication'; Id=9061; StartTime=(Get-Date).AddDays(-2)} -ErrorAction SilentlyContinue
-    $out.Add(("Eventos 9061 (48h): {0}" -f (($ev9061 | Measure-Object).Count)))
-  } catch { $out.Add("Eventos 9061: erro ao consultar: $($_.Exception.Message)") }
-
-  try {
-    $rf = Get-WmiObject -Namespace $ns -Class DfsrReplicatedFolderConfig -Filter ("ReplicatedFolderName='{0}'" -f $RFFolder)
-    foreach ($r in $rf) { Invoke-WmiMethod -InputObject $r -Name ResumeReplication | Out-Null }
-    $out.Add("ResumeReplication (ReplicatedFolderConfig) OK.")
-  } catch { $out.Add("ResumeReplication (ReplicatedFolderConfig) falhou: $($_.Exception.Message)") }
-
-  try {
-    $vols = Get-WmiObject -Namespace $ns -Class DfsrVolumeConfig
-    foreach ($v in $vols) { Invoke-WmiMethod -InputObject $v -Name ResumeReplication | Out-Null }
-    $out.Add("ResumeReplication (VolumeConfig) OK.")
-  } catch { $out.Add("ResumeReplication (VolumeConfig) falhou: $($_.Exception.Message)") }
-
-  try { dfsrdiag PollAD | Out-Null; $out.Add("dfsrdiag PollAD OK.") } catch { $out.Add("dfsrdiag PollAD falhou: $($_.Exception.Message)") }
-  try { Restart-Service DFSR -Force; Start-Sleep -Seconds 5; $out.Add("Restart DFSR OK.") } catch { $out.Add("Restart DFSR falhou: $($_.Exception.Message)") }
-
-  return ($out -join "`n")
+# ===== Funções infra =====
+function Enable-DFSR-Port {
+  param([string]$ComputerName)
+  Invoke-Command -ComputerName $ComputerName -ScriptBlock {
+    $ErrorActionPreference = 'Stop'
+    # PT/EN
+    $grp = Get-NetFirewallRule -DisplayGroup 'DFS Replication','Replicação do DFS' -ErrorAction SilentlyContinue
+    if ($grp) { $grp | Enable-NetFirewallRule | Out-Null }
+    # Regra explícita
+    if (-not (Get-NetFirewallRule -DisplayName 'EDU-DFSR-5722-In' -ErrorAction SilentlyContinue)) {
+      New-NetFirewallRule -DisplayName 'EDU-DFSR-5722-In' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5722 -Profile Any | Out-Null
+    } else {
+      Set-NetFirewallRule -DisplayName 'EDU-DFSR-5722-In' -Enabled True -Action Allow -Profile Any | Out-Null
+    }
+    # Serviço
+    Set-Service DFSR -StartupType Automatic
+    if ((Get-Service DFSR).Status -ne 'Running') { Start-Service DFSR }
+  }
 }
 
-# Função: obtém texto do backlog (executado a partir do SourceDC)
+function Is-Listening5722 {
+  param([string]$ComputerName)
+  $listening = Invoke-Command -ComputerName $ComputerName -ScriptBlock {
+    $ErrorActionPreference = 'SilentlyContinue'
+    $c = Get-NetTCPConnection -State Listen -LocalPort 5722
+    if (-not $c) {
+      $n = (netstat -ano | Select-String -Pattern ':\s*5722\s+LISTENING')
+      if ($n) { 'NETSTAT' } else { $null }
+    } else { 'CIM' }
+  }
+  return [bool]$listening
+}
+
+function Test-5722 {
+  param([string]$From,[string]$To)
+  Invoke-Command -ComputerName $From -ScriptBlock {
+    param($To)
+    $t = Test-NetConnection -ComputerName $To -Port 5722 -WarningAction SilentlyContinue
+    [pscustomobject]@{ From=$env:COMPUTERNAME; To=$To; Tcp=$t.TcpTestSucceeded; Ping=$t.PingSucceeded }
+  } -ArgumentList $To
+}
+
+function Invoke-Native {
+  param([string]$File, [string]$Args)
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $File; $psi.Arguments = $Args
+  $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError  = $true
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEnd(); $err = $p.StandardError.ReadToEnd()
+  $p.WaitForExit()
+  [pscustomobject]@{ ExitCode=$p.ExitCode; StdOut=$out; StdErr=$err; Command="$File $Args" }
+}
+
+function Recreate-Membership {
+  param([string]$Source,[string]$Target,[string]$RGName,[string]$RFFolder)
+  if (-not (Get-Command dfsradmin -ErrorAction SilentlyContinue)) {
+    throw "dfsradmin não encontrado. Instale as DFS Management Tools (RSAT)."
+  }
+  $ns = 'root\microsoftdfs'
+  $memFilter  = "ReplicationGroupName='$RGName' AND ReplicatedFolderName='$RFFolder' AND MemberName='$Target'"
+  $connFilter = "ReplicationGroupName='$RGName' AND SendingMemberName='$Source' AND ReceivingMemberName='$Target'"
+  $mem = Get-WmiObject -Namespace $ns -Class DfsrReplicatedFolderInfo -Filter $memFilter -ErrorAction SilentlyContinue
+  $con = Get-WmiObject -Namespace $ns -Class DfsrConnectionInfo        -Filter $connFilter -ErrorAction SilentlyContinue
+
+  if ($mem) {
+    Invoke-Native dfsradmin ("membership delete /rgname:`"$RGName`" /rfname:`"$RFFolder`" /memname:`"$Target`" /force") | Out-Null
+  }
+  if ($con) {
+    Invoke-Native dfsradmin ("conn delete /rgname:`"$RGName`" /sourcecomputer:`"$Source`" /destinationcomputer:`"$Target`" /force") | Out-Null
+  }
+  Invoke-Native dfsradmin ("membership new /rgname:`"$RGName`" /rfname:`"$RFFolder`" /memname:`"$Target`" /localpath:`"C:\Windows\SYSVOL\domain`" /enabled:true /primary:false") | Out-Null
+  Invoke-Native dfsradmin ("conn new /rgname:`"$RGName`" /sourcecomputer:`"$Source`" /destinationcomputer:`"$Target`" /enabled:true") | Out-Null
+  Invoke-Command -ComputerName $Target -ScriptBlock { dfsrdiag PollAD; Restart-Service DFSR -Force }
+}
+
 function Get-BacklogText {
-  param([string]$Dst)
-  Invoke-Command -ComputerName $SourceDC -ScriptBlock {
+  param([string]$Source,[string]$Dst,[string]$RGName,[string]$RFFolder)
+  Invoke-Command -ComputerName $Source -ScriptBlock {
     param($RGName,$RFFolder,$Src,$Dst)
     dfsrdiag backlog /rgname:$RGName /rfname:$RFFolder /sendingmember:$Src /receivingmember:$Dst
-  } -ArgumentList $RGName,$RFFolder,$SourceDC,$Dst | Out-String
+  } -ArgumentList $RGName,$RFFolder,$Source,$Dst | Out-String
 }
 
-# Função: extrai contagem do backlog (PT/EN) – retorna [int] ou $null
 function Parse-BacklogCount {
   param([string]$Text)
   if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
@@ -97,72 +137,89 @@ function Parse-BacklogCount {
   return $null
 }
 
+# ===== Pré: 5722/serviço no Source =====
+try { Test-WsMan -ComputerName $SourceDC -ErrorAction Stop | Out-Null } catch { throw ("WinRM indisponível em {0}: {1}" -f $SourceDC, $_.Exception.Message) }
+Enable-DFSR-Port -ComputerName $SourceDC
+
 foreach ($t in $Targets) {
 
-  # 0) Pré-cheque WinRM para chamadas ao SourceDC (backlog/SyncNow)
-  try { Test-WsMan -ComputerName $SourceDC -ErrorAction Stop | Out-Null; Add-Ok $t '0' ("WinRM no Source {0}" -f $SourceDC) 'OK' }
-  catch { Add-Ko $t '0' ("WinRM no Source {0}" -f $SourceDC) $_.Exception.Message; continue }
+  # 0) Pré no Target
+  try { Test-WsMan -ComputerName $t -ErrorAction Stop | Out-Null; Add-Ok $t '0' 'WinRM no Target' 'OK' }
+  catch { Add-Ko $t '0' 'WinRM no Target' $_.Exception.Message; continue }
 
-  # 1) ResumeReplication + PollAD + Restart no alvo (local ou remoto)
+  Enable-DFSR-Port -ComputerName $t
+  Invoke-Command -ComputerName $t { dfsrdiag PollAD; Restart-Service DFSR -Force }
+
+  # 0.1) Verificações 5722 + testes cruzados
+  $srcListen = Is-Listening5722 -ComputerName $SourceDC
+  $dstListen = Is-Listening5722 -ComputerName $t
+  Add-Ok $t '0.1' 'LISTEN Source/Target' ("{0}:{1} | {2}:{3}" -f $SourceDC,$srcListen,$t,$dstListen)
+
+  $r1 = Test-5722 -From $SourceDC -To $t
+  $r2 = Test-5722 -From $t        -To $SourceDC
+  Add-Ok $t '0.2' 'Test-NetConnection 5722' (($r1,$r2 | Format-Table -AutoSize | Out-String))
+
+  # 0.2) Se o Target ainda não escuta, recriar membership/conexão e revalidar
+  if (-not $dstListen) {
+    Add-Ko $t '0.3' 'Target não escuta 5722 — recriando membership/conexão' ''
+    Recreate-Membership -Source $SourceDC -Target $t -RGName $RGName -RFFolder $RFFolder
+    Start-Sleep 5
+    $dstListen = Is-Listening5722 -ComputerName $t
+    if ($dstListen) { Add-Ok $t '0.4' '5722 LISTENING após recriar' 'OK' } else { Add-Ko $t '0.4' '5722 ainda não LISTENING após recriar' 'Verifique eventos 4012/9061/2213 no destino' }
+  }
+
+  # 1) ResumeReplication + PollAD + Restart (garantia extra)
   try {
-    if ($t -ieq $env:COMPUTERNAME) {
-      $txt = & $targetScript.Invoke($RGName,$RFFolder)
-    } else {
-      Test-WsMan -ComputerName $t -ErrorAction Stop | Out-Null
-      $txt = Invoke-Command -ComputerName $t -ScriptBlock $targetScript -ArgumentList $RGName,$RFFolder
+    Invoke-Command -ComputerName $t -ScriptBlock {
+      $ns='root\microsoftdfs'
+      $rf=Get-WmiObject -Namespace $ns -Class DfsrReplicatedFolderConfig -Filter ("ReplicatedFolderName='SYSVOL Share'")
+      foreach ($r in $rf){ Invoke-WmiMethod -InputObject $r -Name ResumeReplication | Out-Null }
+      $vol=Get-WmiObject -Namespace $ns -Class DfsrVolumeConfig
+      foreach ($v in $vol){ Invoke-WmiMethod -InputObject $v -Name ResumeReplication | Out-Null }
+      dfsrdiag PollAD | Out-Null
+      Restart-Service DFSR -Force
     }
-    Add-Ok $t '1' 'ResumeReplication + PollAD + Restart DFSR' $txt
+    Add-Ok $t '1' 'ResumeReplication + Restart DFSR' 'OK'
   } catch {
-    Add-Ko $t '1' 'ResumeReplication + PollAD + Restart DFSR' $_.Exception.Message
-    continue
+    Add-Ko $t '1' 'ResumeReplication + Restart DFSR' $_.Exception.Message
   }
 
-  # 2) SyncNow (feito do SourceDC)
+  # 2) SyncNow (do Source)
   try {
-    $o = Invoke-Command -ComputerName $SourceDC -ScriptBlock { dfsrdiag SyncNow /RGName:"Domain System Volume" /Time:2 /Verbose } | Out-String
-    Add-Ok $t '2' 'dfsrdiag SyncNow (a partir do SourceDC)' $o
+    Invoke-Command -ComputerName $SourceDC { dfsrdiag SyncNow /RGName:"Domain System Volume" /Time:2 /Verbose | Out-Null }
+    Add-Ok $t '2' 'dfsrdiag SyncNow' 'OK'
   } catch {
-    Add-Ko $t '2' 'dfsrdiag SyncNow (a partir do SourceDC)' $_.Exception.Message
+    Add-Ko $t '2' 'dfsrdiag SyncNow' $_.Exception.Message
   }
 
-  # 3) Acompanhar backlog até 0 (ou timeout) – com progresso
+  # 3) Aguardar backlog = 0
   $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-  $lastTxt  = ''
-  $ok = $false
+  $lastTxt = ''; $ok=$false
   while ((Get-Date) -lt $deadline) {
     try {
-      $txt = Get-BacklogText -Dst $t
+      $txt = Get-BacklogText -Source $SourceDC -Dst $t -RGName $RGName -RFFolder $RFFolder
       $lastTxt = $txt
       $cnt = Parse-BacklogCount -Text $txt
       $minsLeft = [int]([Math]::Ceiling(($deadline - (Get-Date)).TotalMinutes))
       if ($null -ne $cnt) {
         Write-Host ("[{0} → {1}] Backlog={2} (restam ~{3} min)" -f $SourceDC,$t,$cnt,$minsLeft)
-        if ($cnt -le 0) { $ok = $true; break }
+        if ($cnt -le 0) { $ok=$true; break }
       } else {
         Write-Host ("[{0} → {1}] Backlog=indeterminado (restam ~{2} min)" -f $SourceDC,$t,$minsLeft)
       }
-    } catch {
-      $lastTxt = $_.Exception.Message
-      Write-Host ("[{0} → {1}] Erro ao consultar backlog: {2}" -f $SourceDC,$t,$_.Exception.Message)
-    }
+    } catch { $lastTxt = $_.Exception.Message }
     Start-Sleep -Seconds 10
   }
-
   if ($ok) { Add-Ok $t '3' 'Aguardar backlog=0' ($lastTxt -split "`r?`n" | Select-Object -First 8 | Out-String) }
   else     { Add-Ko $t '3' ('Aguardar backlog=0 (timeout {0} min)' -f $TimeoutMinutes) ($lastTxt -split "`r?`n" | Select-Object -First 12 | Out-String) }
 
-  # 4) Validação SYSVOL/NETLOGON
+  # 4) SYSVOL/NETLOGON e Advertising
   try {
-    if ($t -ieq $env:COMPUTERNAME) {
-      $shares = net share | findstr /I "SYSVOL NETLOGON" | Out-String
-    } else {
-      $shares = Invoke-Command -ComputerName $t -ScriptBlock { net share | findstr /I "SYSVOL NETLOGON" } | Out-String
-    }
+    $shares = Invoke-Command -ComputerName $t -ScriptBlock { net share | findstr /I "SYSVOL NETLOGON" } | Out-String
     $pass = ($shares -match 'SYSVOL') -and ($shares -match 'NETLOGON')
     if ($pass) { Add-Ok $t '4' 'Shares SYSVOL/NETLOGON' $shares } else { Add-Ko $t '4' 'Shares SYSVOL/NETLOGON' $shares }
   } catch { Add-Ko $t '4' 'Shares SYSVOL/NETLOGON' $_.Exception.Message }
 
-  # 5) Advertising
   try {
     $LASTEXITCODE = $null
     $o = & dcdiag /test:advertising /s:$t 2>&1 | Out-String
@@ -177,7 +234,6 @@ $log | Export-Csv -Path $outCsv -NoTypeInformation -Encoding UTF8
 $total = $log.Count
 $pass  = ($log | ? Passed).Count
 $fail  = $total - $pass
-
 $targetsHtml = foreach ($t in $Targets) {
   $sub = $log | Where-Object { $_.Target -eq $t }
   if (-not $sub) { continue }
@@ -197,37 +253,25 @@ $targetsHtml = foreach ($t in $Targets) {
   </div>
 "@
 }
-
 $html = @"
 <!DOCTYPE html>
 <html lang='pt-br'>
 <head>
 <meta charset='utf-8'/>
-<title>Fix SYSVOL – Item A v3 (via $SourceDC) – $ts</title>
+<title>Fix SYSVOL – Item A v3.1 (via $SourceDC) – $ts</title>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: Segoe UI, Roboto, Arial, sans-serif; margin:24px; }
   h1 { margin:0 0 4px 0; font-size:22px; }
   .sub { color:#555; margin:0 0 16px 0; }
-  .summary { display:flex; gap:16px; margin: 16px 0 12px 0; flex-wrap: wrap; }
-  .card { padding:12px 16px; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
-  .all { background:#eef4ff; border:1px solid #c9d8ff; }
-  .ok  { background:#e8fff0; border:1px solid #b6f0c9; }
-  .bad { background:#ffecec; border:1px solid #ffb3b3; }
   table { width:100%; border-collapse:collapse; }
   th,td { border-bottom:1px solid #eee; padding:8px 10px; vertical-align:top; }
   th { text-align:left; background:#fafafa; }
   tr.pass td { background:#f7fff9; }
   tr.fail td { background:#fff7f7; }
   pre { margin:0; white-space:pre-wrap; word-wrap:break-word; }
-  .section { margin-top:28px; }
   @media (prefers-color-scheme: dark) {
     body { color:#eee; background:#121212; }
-    .sub { color:#bbb; }
-    .card { box-shadow:none; }
-    .all { background:#1b2744; border-color:#30487c; }
-    .ok  { background:#14301d; border-color:#1f7a46; }
-    .bad { background:#3a1b1b; border-color:#7a2e2e; }
     th { background:#1b1b1b; }
     th,td { border-bottom:1px solid #2a2a2a; }
     tr.pass td { background:#0e2216; }
@@ -236,28 +280,12 @@ $html = @"
 </style>
 </head>
 <body>
-  <h1>Fix SYSVOL (DFSR) – Item A v3 – via $(Escape-Html $SourceDC)</h1>
+  <h1>Fix SYSVOL (DFSR) – via $(Escape-Html $SourceDC)</h1>
   <div class='sub'>Geração: $ts — Alvos: $(Escape-Html ($Targets -join ', ')) — Total: $total (PASS: $pass, FAIL: $fail)</div>
-
-  <div class='summary'>
-    <div class='card all'>Total: <b>$total</b></div>
-    <div class='card ok'>Pass: <b>$pass</b></div>
-    <div class='card bad'>Fail: <b>$fail</b></div>
-  </div>
-
   $($targetsHtml -join "`n")
-
-  <div class='section'>
-    <h2>Observações</h2>
-    <ul>
-      <li>Se persistirem eventos <b>4012/9061</b> e o backlog não iniciar, remova e recrie o <i>membership</i> do alvo no RG "<code>$RGName</code>" para forçar uma nova sincronização inicial.</li>
-      <li>Após backlog = 0, verifique os compartilhamentos <code>SYSVOL</code>/<code>NETLOGON</code> e o teste <code>dcdiag /test:advertising</code>.</li>
-    </ul>
-  </div>
 </body>
 </html>
 "@
-
 $html | Out-File -FilePath $outHtml -Encoding UTF8
 $log  | Export-Csv -Path $outCsv -NoTypeInformation -Encoding UTF8
 
