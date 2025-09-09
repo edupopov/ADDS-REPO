@@ -3,6 +3,7 @@
   Autor:  Criado por Eduardo Popovici
   Nota:   Para que TODOS os testes funcionem (especialmente o mapeamento de endpoints RPC no EPM/135),
           instale o PortQry e deixe acessível (ex.: C:\PortQryV2\portqry.exe).
+          Comando completo de verificação do ambiente: dcdiag /e /q /v /c /fix /testdomain:nome-do.dominio
 #>
 
 $ErrorActionPreference = 'Stop'
