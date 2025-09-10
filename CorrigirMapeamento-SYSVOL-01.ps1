@@ -230,7 +230,7 @@ try {
     if ($null -ne $ready) { Write-Host ("SysVolReady        : {0}" -f $ready) }
 
     Write-Host ""
-    Write-Host "✅ Concluído. SYSVOL/NETLOGON corrigidos conforme boas práticas." -ForegroundColor Green
+    Write-Host "   Concluído. SYSVOL/NETLOGON corrigidos conforme boas práticas." -ForegroundColor Green
     Write-Host "   Shares -> Full: Administrators,SYSTEM | Read: Authenticated Users | Caching: None (se suportado)"
     Write-Host "   NTFS  -> Admin/SYSTEM Full; CREATOR OWNER Full (herdado); Authenticated Users Read+Execute"
 
