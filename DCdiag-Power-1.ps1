@@ -2,6 +2,7 @@
   Merge – AD Health Check + DCDiag (PS 5.1/7)
   Autor: Eduardo Popovici (base dos dois scripts) – Unificado e comentado
   Versão: Beta 1.0 - ainda em refinamento - Não esta pronto
+  Obs: Dependendo do tamanho do ambiente, script pode demorar para ser finalizado
 
   O que faz:
    - Executa DCDiag com /e /q /v /c /fix; grava TXT e consolida parsing EN/PT no HTML (mesmo formato do script 2).
