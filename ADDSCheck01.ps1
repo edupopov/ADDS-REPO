@@ -28,6 +28,8 @@ param(
   [string]$ExportJson
 )
 
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Unrestricted -Force
+
 # -------- Caminho padrão: Desktop do usuário --------
 try {
   $desktop = [Environment]::GetFolderPath('Desktop')
