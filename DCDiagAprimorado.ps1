@@ -14,6 +14,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Unrestricted -Force
 
 # ===== Saídas =====
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
