@@ -171,7 +171,7 @@ try {
   Ensure-OU -Name "Ativos"   -Path $ouTerceirosDN -Description "Unidade Organizacional de Terceiros Ativos"   -Protect:$EnableProtection | Out-Null
   Ensure-OU -Name "Inativos" -Path $ouTerceirosDN -Description "Unidade Organizacional de Terceiros Inativos" -Protect:$EnableProtection | Out-Null
 
-  Write-Host "✅ Estrutura criada/validada com sucesso no domínio: $rootDN"
+  Write-Host "Estrutura criada/validada com sucesso no domínio: $rootDN"
 }
 catch {
   Write-Error "Falha ao criar estrutura: $($_.Exception.Message)"
