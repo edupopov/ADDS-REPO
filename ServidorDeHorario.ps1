@@ -13,6 +13,10 @@
 # /update                → aplica imediatamente as mudanças
 w32tm /config /manualpeerlist:"pool.ntp.org" /syncfromflags:manual /reliable:yes /update
 
+# Para definir o fuso horário de São Paulo (Brasília, UTC-03:00) no Windows Server:
+tzutil /s "E. South America Standard Time"
+tzutil /g
+
 # --- Reinício do serviço de tempo ---
 # Interrompe o serviço de tempo do Windows para aplicar as novas configurações
 net stop w32time
