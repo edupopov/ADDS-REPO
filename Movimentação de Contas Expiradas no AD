@@ -1,0 +1,143 @@
+# =========================
+# Script: Movimentação de Contas Expiradas no AD
+# Autor: [Augusto Kalel - Kyndryl WMS TEAM]
+# Data: [04-11-2025]
+# =========================
+
+# 1) Permitir execução do script
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+Import-Module ActiveDirectory
+
+# 2) Variáveis
+$agora        = Get-Date
+$dataAtual    = $agora.ToString("dd-MM-yyyy")
+$arquivoSaida = "C:\Relatorio_Contas_Movidas_$dataAtual.csv"
+$movidas     = @()
+$limiteDias  = 75
+$dataLimite  = $agora.AddDays(-$limiteDias)
+$expDate     = Get-Date "01/01/2000"
+
+# OU origem e destino
+$ouOrigemList = @("OU=Maneja Facilities,OU=Suppliers,DC=REDERECORD,DC=com,DC=br")
+$ouDestino    = "OU=Inativos,OU=Suppliers,DC=REDERECORD,DC=com,DC=br"
+
+# Configuração de e-mail
+$EmailTo    = @("conta1@empresa.com.br", "conta1@empresa.com.br", "conta1@empresa.com.br")
+$EmailFrom  = "conta1@empresa.com.br"
+$Subject    = "Relatório - Contas movidas automaticamente"
+$SMTPServer = "192.168.1.10"
+$SMTPPort   = 25
+
+
+
+# 3) Processar OU
+foreach ($ouOrigem in $ouOrigemList) {
+    Write-Host "`nVerificando OU: $ouOrigem" -ForegroundColor Cyan
+
+    $contas = Get-ADUser -SearchBase $ouOrigem -SearchScope Subtree `
+        -LDAPFilter "(&(objectClass=user)(!(objectClass=computer)))" `
+        -Properties SamAccountName, Name, AccountExpirationDate, Enabled, DistinguishedName, info, manager
+
+    $contasParaMover = $contas | Where-Object {
+        $_.Enabled -eq $false -and
+        $_.AccountExpirationDate -ne $null -and
+        $_.AccountExpirationDate -lt $dataLimite
+    }
+
+    if (-not $contasParaMover -or $contasParaMover.Count -eq 0) {
+        Write-Host "Nenhuma conta desativada e expirada há mais de $limiteDias dias encontrada na OU $ouOrigem." -ForegroundColor Yellow
+        continue
+    }
+
+    foreach ($user in $contasParaMover) {
+        try {
+            # Capturar gerente antes de limpar
+            $gerenteRemovido = $user.manager
+
+            # Capturar grupos antes de remover
+            $groupsToRemove = Get-ADPrincipalGroupMembership -Identity $user.SamAccountName |
+                Where-Object { $_.Name -ne "Domain Users" }
+            $gruposRemovidos = ($groupsToRemove | Select-Object -ExpandProperty Name) -join "; "
+
+            # 1) Atualizar campo info
+            $notaAutomacao = "Movida para $ouDestino em $($agora.ToString("dd/MM/yyyy HH:mm"))"
+            $currentInfo   = $user.info
+            $newInfo = if ([string]::IsNullOrWhiteSpace($currentInfo)) {
+                $notaAutomacao
+            } else {
+                ($currentInfo.Trim() + "`r`n" + $notaAutomacao)
+            }
+            Set-ADUser -Identity $user.SamAccountName -Replace @{info = $newInfo} -ErrorAction Stop
+
+            # 2) Setar data de expiração para 01/01/2000
+            Set-ADUser -Identity $user.SamAccountName -AccountExpirationDate $expDate -ErrorAction Stop
+
+            # 3) Limpar campo Manager
+            Set-ADUser -Identity $user.SamAccountName -Clear manager -ErrorAction Stop
+
+            # 4) Mover para a OU "Inativos"
+            Move-ADObject -Identity $user.DistinguishedName -TargetPath $ouDestino -ErrorAction Stop
+
+            # 5) Remover todos os grupos, exceto "Domain Users"
+            foreach ($group in $groupsToRemove) {
+                Remove-ADGroupMember -Identity $group -Members $user.SamAccountName -Confirm:$false
+            }
+
+            # Adicionar ao relatório com novas colunas
+            $movidas += [PSCustomObject]@{
+                Login           = $user.SamAccountName
+                Nome            = $user.Name
+                DataExpiracao   = $user.AccountExpirationDate.ToString("dd/MM/yyyy HH:mm")
+                OU_Original     = ($user.DistinguishedName -split ',', 2)[1]
+                OU_Nova         = $ouDestino
+                MovidaEm        = $agora.ToString("dd/MM/yyyy HH:mm")
+                GerenteRemovido = $gerenteRemovido
+                GruposRemovidos = $gruposRemovidos
+            }
+
+            Write-Host "Conta movida e ajustada: $($user.SamAccountName)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Falha ao processar $($user.SamAccountName): $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+}
+
+# 4) Gerar relatório e enviar e-mail
+if ($movidas.Count -eq 0) {
+    Write-Host "`nNenhuma conta foi movida. Sem envio de e-mail." -ForegroundColor Yellow
+    return
+}
+
+$movidas | Export-Csv -Path $arquivoSaida -NoTypeInformation -Encoding UTF8
+Write-Host "`nRelatório salvo em: $arquivoSaida" -ForegroundColor Green
+
+# Montar corpo HTML com novas colunas
+$tableHtml = $movidas |
+    Select-Object Login, Nome, DataExpiracao, OU_Original, OU_Nova, GerenteRemovido, GruposRemovidos, MovidaEm |
+    ConvertTo-Html -Fragment
+
+$htmlBody = @"
+<html>
+<head>
+<meta charset='UTF-8'>
+<style>
+    body { font-family: Segoe UI, Arial, sans-serif; color: #1a1a1a; }
+    h2   { color: #0b5cad; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #cccccc; padding: 6px 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+</style>
+</head>
+<body>
+    <h2>Contas movidas automaticamente</h2>
+    <p>Execução: <strong>$($agora.ToString("dd/MM/yyyy HH:mm"))</strong></p>
+    <p>Total movidas: <strong>$($movidas.Count)</strong></p>
+    $tableHtml
+    <p style="margin-top:12px;">Relatório completo em anexo: <code>$([System.IO.Path]::GetFileName($arquivoSaida))</code></p>
+</body>
+</html>
+"@
+
+Send-MailMessage -From $EmailFrom -To $EmailTo -Subject $Subject -Body $htmlBody -BodyAsHtml `
+    -SmtpServer $SMTPServer -Port $SMTPPort -Attachments $arquivoSaida -Encoding UTF8
