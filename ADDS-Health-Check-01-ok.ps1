@@ -346,7 +346,7 @@ $css = @"
 
 $htmlHeader = @"
 <html>
-<head><meta charset="utf-8" /><title>Active Directory Health Check</title>$css</head>
+<head><meta charset="utf-8" /><title>Active Directory Health Check By Popovici</title>$css</head>
 <body>
 <h1>Active Directory Health Check</h1>
 
