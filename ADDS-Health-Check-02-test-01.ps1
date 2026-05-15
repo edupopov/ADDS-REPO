@@ -1,32 +1,31 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  AD Health Check (Windows PowerShell 5.1) - Relatório HTML + checagens de conectividade, portas, DNS e DCDIAG.
+  AD DS Health Check - Windows PowerShell 5.1
 
 .DESCRIPTION
-  Este script executa um conjunto de verificações comuns de saúde de Active Directory em todos os Domain Controllers da floresta atual:
-  - Ping (via ping.exe)
-  - Teste de portas TCP (88/389/636/3268/3269/135/139/445/53)
-  - Teste UDP (DNS 53 funcional via nslookup; Kerberos/LDAP UDP opcional para reduzir ruído)
-  - Testes DNS funcionais: A (self), SRV _ldap._tcp.dc._msdcs.<ForestRoot>, PTR (reverse)
-  - Serviços: Netlogon, NTDS, DNS (via WMI, com fallback para sc.exe)
-  - dcdiag com timeout real (executa 1 vez por DC e faz parse dos testes principais)
-
-  Gera relatório HTML colorido (default: Desktop) e exporta CSV/JSON opcionalmente.
-  Inclui "Cliente" e "Analista" no rodapé e nas exportações.
+  Valida a saúde e conectividade dos Domain Controllers da floresta atual:
+  - Ping via ping.exe
+  - Portas TCP: Kerberos (88), LDAP (389), LDAPS (636), GC (3268/3269), RPC/SMB (135/139/445), DNS (53)
+  - Portas UDP: DNS (53) funcional via nslookup; Kerberos/LDAP UDP opcional (por padrão NotTested)
+  - DNS funcional: A(Self), SRV _ldap._tcp.dc._msdcs.<ForestRoot>, PTR(Self)
+  - Serviços: Netlogon, NTDS, DNS (WMI + fallback sc.exe)
+  - DCDIAG com timeout real: executa 1x por DC e faz parse dos testes principais
+  - Relatório HTML colorido (Desktop por padrão), exportações CSV/JSON opcionais e envio de e-mail opcional
 
 .AUTHOR
   Eduardo Popovici
 
 .REFERENCE (ponto de partida)
-  Script anterior "AD Health Check – PS 5.1/7" fornecido pelo autor nesta conversa.
+  Script anterior fornecido pelo autor nesta conversa:
+  "AD Health Check – PS 5.1/7" (versão base)
   Repositório de referência inicial: https://github.com/edupopov/ADDS-REPO/tree/main
 
 .NOTES
   - Compatível com Windows PowerShell 5.1 (sem operador ternário ? : e sem recursos do PS7).
   - Em ambientes que bloqueiam ICMP internamente, "PingFail" pode ocorrer mesmo com DC saudável.
-  - UDP: Kerberos/LDAP via UDP normalmente não responde a datagramas genéricos; por padrão fica NotTested
-    para evitar "amarelo" em massa. Habilite com -IncludeUdpLegacy se você realmente precisar.
+  - UDP Kerberos/LDAP normalmente não responde a datagramas genéricos => ruído; por padrão NotTested.
+    Use -IncludeUdpLegacy se quiser habilitar os testes UDP para Kerberos/LDAP.
 #>
 
 [CmdletBinding()]
@@ -37,37 +36,70 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$ClientName,
 
-  # Timeout (segundos) para execução do dcdiag por DC
   [int]$TimeoutSeconds = 180,
 
-  # Caminho do relatório HTML (se vazio, salva no Desktop como ADReport.html)
   [string]$OutputPath,
-
-  # Exportações opcionais
   [string]$ExportCsv,
   [string]$ExportJson,
 
-  # Email opcional (PS 5.1 possui Send-MailMessage)
   [string]$SmtpHost,
   [string]$EmailTo,
   [string]$EmailFrom = 'ADHealthCheck@domain.com',
   [int]$SmtpPort = 25,
   [switch]$UseSsl,
 
-  # UDP legado (Kerberos/LDAP) desativado por padrão para reduzir ruído
-  [switch]$IncludeUdpLegacy
+  [switch]$IncludeUdpLegacy,
+
+  # Exibe mensagens de validação (além do progress bar).
+  [switch]$ShowValidationMessages
 )
 
 # ============================================================
-# 1) Definição do caminho padrão do relatório (Desktop)
+# 0) Helpers de log / progresso
 # ============================================================
+
+function Write-Stage {
+  param(
+    [Parameter(Mandatory)][string]$Dc,
+    [Parameter(Mandatory)][string]$Message,
+    [ConsoleColor]$Color = [ConsoleColor]::Cyan
+  )
+  if ($ShowValidationMessages) {
+    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    Write-Host ("[{0}] [{1}] {2}" -f $ts, $Dc, $Message) -ForegroundColor $Color
+  }
+}
+
+function Update-Progress {
+  param(
+    [int]$ParentId,
+    [int]$Id,
+    [string]$Activity,
+    [string]$Status,
+    [int]$Percent
+  )
+  if ($ParentId -ge 0) {
+    Write-Progress -Id $Id -ParentId $ParentId -Activity $Activity -Status $Status -PercentComplete $Percent
+  } else {
+    Write-Progress -Id $Id -Activity $Activity -Status $Status -PercentComplete $Percent
+  }
+}
+
+function Complete-Progress {
+  param([int]$Id)
+  try { Write-Progress -Id $Id -Completed } catch {}
+}
+
+# ============================================================
+# 1) Caminho padrão do relatório (Desktop)
+# ============================================================
+
 try {
   $desktop = [Environment]::GetFolderPath('Desktop')
   if ([string]::IsNullOrWhiteSpace($desktop)) {
     $desktop = Join-Path $env:USERPROFILE 'Desktop'
   }
-}
-catch {
+} catch {
   $desktop = Join-Path $env:USERPROFILE 'Desktop'
 }
 
@@ -76,7 +108,7 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 }
 
 # ============================================================
-# 2) Funções utilitárias
+# 2) Funções de rede / serviços
 # ============================================================
 
 function To-ShortName {
@@ -85,220 +117,161 @@ function To-ShortName {
   return $Fqdn
 }
 
-# Ping via ping.exe (evita diferenças entre versões/ICMP libs)
 function Test-PingHost {
-  param(
-    [Parameter(Mandatory)][string]$ComputerName,
-    [int]$TimeoutSeconds = 3
-  )
+  param([Parameter(Mandatory)][string]$ComputerName,[int]$TimeoutSeconds=3)
   try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "$env:SystemRoot\System32\PING.EXE"
-    $psi.Arguments = "-n 1 -w $($TimeoutSeconds * 1000) $ComputerName"
+    $psi.Arguments = "-n 1 -w $([int]($TimeoutSeconds*1000)) $ComputerName"
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError  = $true
-
     $p = [System.Diagnostics.Process]::Start($psi)
-    $null = $p.WaitForExit(($TimeoutSeconds + 1) * 1000)
-
+    $null = $p.WaitForExit(($TimeoutSeconds+1)*1000)
     if ($p.HasExited -and $p.ExitCode -eq 0) { return $true }
-  }
-  catch { }
+  } catch {}
   return $false
 }
 
-# Teste TCP (socket connect com timeout)
 function Test-TcpPort {
-  param(
-    [Parameter(Mandatory)][string]$ComputerName,
-    [Parameter(Mandatory)][int]$Port,
-    [int]$TimeoutSeconds = 3
-  )
+  param([Parameter(Mandatory)][string]$ComputerName,[Parameter(Mandatory)][int]$Port,[int]$TimeoutSeconds=3)
   try {
     $client = New-Object System.Net.Sockets.TcpClient
-    $iar = $client.BeginConnect($ComputerName, $Port, $null, $null)
-    if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutSeconds * 1000)) {
-      $client.Close()
-      return 'Closed'
-    }
+    $iar = $client.BeginConnect($ComputerName,$Port,$null,$null)
+    if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutSeconds*1000)) { $client.Close(); return 'Closed' }
     $client.EndConnect($iar) | Out-Null
     $client.Close()
     return 'Open'
-  }
-  catch {
-    return 'Closed'
-  }
+  } catch { return 'Closed' }
 }
 
-# Teste UDP (genérico). Por padrão não é usado para Kerberos/LDAP porque tende a gerar NoReply.
 function Test-UdpPort {
-  param(
-    [Parameter(Mandatory)][string]$ComputerName,
-    [Parameter(Mandatory)][int]$Port,
-    [int]$TimeoutSeconds = 3
-  )
+  param([Parameter(Mandatory)][string]$ComputerName,[Parameter(Mandatory)][int]$Port,[int]$TimeoutSeconds=3)
   try {
     $udp = New-Object System.Net.Sockets.UdpClient
-    $udp.Client.ReceiveTimeout = $TimeoutSeconds * 1000
-    $udp.Connect($ComputerName, $Port)
-
+    $udp.Client.ReceiveTimeout = $TimeoutSeconds*1000
+    $udp.Connect($ComputerName,$Port)
     $bytes = [System.Text.Encoding]::ASCII.GetBytes("hi")
-    [void]$udp.Send($bytes, $bytes.Length)
-
+    [void]$udp.Send($bytes,$bytes.Length)
     Start-Sleep -Milliseconds 250
-
     if ($udp.Available -gt 0) {
-      $remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+      $remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any,0)
       $null = $udp.Receive([ref]$remote)
       $udp.Close()
       return 'Open'
-    }
-    else {
+    } else {
       $udp.Close()
       return 'NoReply'
     }
-  }
-  catch {
-    try { $udp.Close() } catch { }
+  } catch {
+    try { $udp.Close() } catch {}
     return 'NoReply'
   }
 }
 
-# Status de serviço remoto: WMI (Win32_Service) com fallback sc.exe
 function Get-ServiceStatusSafe {
-  param(
-    [Parameter(Mandatory)][string]$ComputerName,
-    [Parameter(Mandatory)][string]$ServiceName
-  )
+  param([Parameter(Mandatory)][string]$ComputerName,[Parameter(Mandatory)][string]$ServiceName)
 
-  # 1) WMI: costuma ser a forma mais compatível em servidores legados
+  # WMI (compatível com ambientes legados)
   try {
     $svc = Get-WmiObject -Class Win32_Service -ComputerName $ComputerName -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
     if ($null -eq $svc) { return 'Unknown' }
 
-    if ($svc.State -eq 'Running') {
-      return 'Running'
-    }
-    else {
-      return [string]$svc.State
-    }
-  }
-  catch {
-    # 2) Fallback: sc.exe (RPC)
+    if ($svc.State -eq 'Running') { return 'Running' }
+    else { return [string]$svc.State }
+  } catch {
+    # fallback sc.exe
     try {
       $out = & sc.exe "\\$ComputerName" query $ServiceName 2>$null
       if ($LASTEXITCODE -ne 0 -or -not $out) { return 'ConnError' }
-
       if ($out -match 'STATE\s+:\s+\d+\s+RUNNING') { return 'Running' }
       if ($out -match 'STATE\s+:\s+\d+\s+STOPPED') { return 'Stopped' }
-
       return 'Unknown'
-    }
-    catch {
+    } catch {
       return 'ConnError'
     }
   }
 }
 
-# Teste de shares NETLOGON/SYSVOL
 function Test-UncShare {
-  param(
-    [Parameter(Mandatory)][string]$ComputerName,
-    [Parameter(Mandatory)][ValidateSet('NETLOGON', 'SYSVOL')] [string]$ShareName
-  )
+  param([Parameter(Mandatory)][string]$ComputerName,[Parameter(Mandatory)][ValidateSet('NETLOGON','SYSVOL')] [string]$ShareName)
   try {
-    $path = ("filesystem::\\{0}\{1}" -f $ComputerName, $ShareName)
-    if (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue) { return 'Passed' }
+    $p = ("filesystem::\\{0}\{1}" -f $ComputerName,$ShareName)
+    if (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) { return 'Passed' }
     return 'Failed'
-  }
-  catch {
+  } catch {
     return 'Failed'
   }
 }
 
 # ============================================================
-# 3) DNS compatível: Resolve-DnsName (se existir) -> nslookup
+# 3) DNS compatível (Resolve-DnsName -> nslookup)
 # ============================================================
 
 function Resolve-DnsACompat {
-  param(
-    [Parameter(Mandatory)][string]$Name,
-    [Parameter(Mandatory)][string]$Server
-  )
+  param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Server)
 
   if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
     try {
       $a = Resolve-DnsName -Name $Name -Type A -Server $Server -ErrorAction Stop
       $ip = $a | Where-Object { $_.IPAddress } | Select-Object -First 1 -ExpandProperty IPAddress
-      if ($ip) { return @{ Status = 'Passed'; Value = $ip } }
-    } catch { }
+      if ($ip) { return @{ Status='Passed'; Value=$ip } }
+    } catch {}
   }
 
   try {
     $out = & nslookup.exe $Name $Server 2>$null
     $m = ($out | Select-String -Pattern 'Address:\s+(\d{1,3}(\.\d{1,3}){3})' | Select-Object -First 1)
     if ($m -and $m.Matches[0].Groups[1].Value) {
-      return @{ Status = 'Passed'; Value = $m.Matches[0].Groups[1].Value }
+      return @{ Status='Passed'; Value=$m.Matches[0].Groups[1].Value }
     }
-  } catch { }
+  } catch {}
 
-  return @{ Status = 'Failed'; Value = $null }
+  return @{ Status='Failed'; Value=$null }
 }
 
 function Resolve-DnsSrvCompat {
-  param(
-    [Parameter(Mandatory)][string]$Name,
-    [Parameter(Mandatory)][string]$Server
-  )
+  param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Server)
 
   if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
     try {
       $srv = Resolve-DnsName -Name $Name -Type SRV -Server $Server -ErrorAction Stop
-      if ($srv) { return @{ Status = 'Passed'; Value = 'OK' } }
-    } catch { }
+      if ($srv) { return @{ Status='Passed'; Value='OK' } }
+    } catch {}
   }
 
   try {
     $out = & nslookup.exe "-type=SRV" $Name $Server 2>$null
-    # Heurística simples: se aparecerem linhas típicas de SRV, considera Passed
     if ($out -match 'svr hostname|service location|SRV service location') {
-      return @{ Status = 'Passed'; Value = 'OK' }
+      return @{ Status='Passed'; Value='OK' }
     }
-  } catch { }
+  } catch {}
 
-  return @{ Status = 'Failed'; Value = $null }
+  return @{ Status='Failed'; Value=$null }
 }
 
 function Resolve-DnsPtrCompat {
-  param(
-    [Parameter(Mandatory)][string]$Ip,
-    [Parameter(Mandatory)][string]$Server
-  )
+  param([Parameter(Mandatory)][string]$Ip,[Parameter(Mandatory)][string]$Server)
 
   if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
     try {
       $ptr = Resolve-DnsName -Name $Ip -Type PTR -Server $Server -ErrorAction Stop
-      if ($ptr) { return @{ Status = 'Passed'; Value = 'OK' } }
-    } catch { }
+      if ($ptr) { return @{ Status='Passed'; Value='OK' } }
+    } catch {}
   }
 
   try {
     $out = & nslookup.exe "-type=PTR" $Ip $Server 2>$null
     if ($out -match 'name\s*=' -or $out -match 'PTR') {
-      return @{ Status = 'Passed'; Value = 'OK' }
+      return @{ Status='Passed'; Value='OK' }
     }
-  } catch { }
+  } catch {}
 
-  return @{ Status = 'Failed'; Value = $null }
+  return @{ Status='Failed'; Value=$null }
 }
 
-# DNS UDP funcional: nslookup usa UDP por padrão (melhor do que "send hi")
 function Test-DnsUdpFunctional {
-  param(
-    [Parameter(Mandatory)][string]$Name,
-    [Parameter(Mandatory)][string]$Server
-  )
+  param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Server)
 
   try {
     $out = & nslookup.exe $Name $Server 2>$null
@@ -306,14 +279,13 @@ function Test-DnsUdpFunctional {
     if ($out -match 'timed out|timeout') { return 'NoReply' }
     if ($out -match 'Address:' ) { return 'Passed' }
     return 'NoReply'
-  }
-  catch {
+  } catch {
     return 'NoReply'
   }
 }
 
 # ============================================================
-# 4) DCDIAG com timeout real (executa 1 vez por DC e parseia)
+# 4) DCDIAG 1x por DC + parse
 # ============================================================
 
 function Get-DcDiagTestStatusFromOutput {
@@ -321,26 +293,21 @@ function Get-DcDiagTestStatusFromOutput {
     [Parameter(Mandatory)][string]$Output,
     [Parameter(Mandatory)][string]$TestName
   )
+  $t = [Regex]::Escape($TestName)
 
-  # Procura "passed test <TestName>" (case-insensitive, multiline)
-  if ($Output -match ("(?im)\bpassed\s+test\s+{0}\b" -f [Regex]::Escape($TestName))) { return 'Passed' }
-  if ($Output -match ("(?im)\bfailed\s+test\s+{0}\b" -f [Regex]::Escape($TestName))) { return 'Failed' }
-  if ($Output -match ("(?im)\bskipped\s+test\s+{0}\b" -f [Regex]::Escape($TestName))) { return 'Unknown' }
+  if ($Output -match ("(?im)\bpassed\s+test\s+{0}\b" -f $t)) { return 'Passed' }
+  if ($Output -match ("(?im)\bfailed\s+test\s+{0}\b" -f $t)) { return 'Failed' }
+  if ($Output -match ("(?im)\bskipped\s+test\s+{0}\b" -f $t)) { return 'Unknown' }
 
-  # Se não encontrou, retorna Unknown para não gerar falso negativo
   return 'Unknown'
 }
 
 function Invoke-DcDiagSummary {
   [CmdletBinding()]
-  param(
-    [Parameter(Mandatory)][string]$ComputerName,
-    [int]$TimeoutSeconds = 180
-  )
+  param([Parameter(Mandatory)][string]$ComputerName,[int]$TimeoutSeconds=180)
 
-  # Se dcdiag não estiver disponível, retorna Failed
   try { $exe = (Get-Command -Name 'dcdiag.exe' -ErrorAction Stop).Source }
-  catch { return @{ _status = 'Failed'; _raw = $null } }
+  catch { return @{ _status='Failed'; _raw=$null } }
 
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $exe
@@ -354,23 +321,19 @@ function Invoke-DcDiagSummary {
 
   try {
     $null = $proc.Start()
-
-    # Timeout real
-    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
-      try { $proc.Kill() | Out-Null } catch { }
-      return @{ _status = 'Timeout'; _raw = $null }
+    $finished = $proc.WaitForExit($TimeoutSeconds*1000)
+    if (-not $finished) {
+      try { $proc.Kill() | Out-Null } catch {}
+      return @{ _status='Timeout'; _raw=$null }
     }
-
     $output = $proc.StandardOutput.ReadToEnd() + $proc.StandardError.ReadToEnd()
-  }
-  catch {
-    return @{ _status = 'Failed'; _raw = $null }
-  }
-  finally {
-    try { $proc.Close() } catch { }
+  } catch {
+    return @{ _status='Failed'; _raw=$null }
+  } finally {
+    try { $proc.Close() } catch {}
   }
 
-  $result = @{
+  $res = @{
     NetLogons    = Get-DcDiagTestStatusFromOutput -Output $output -TestName 'NetLogons'
     Replications = Get-DcDiagTestStatusFromOutput -Output $output -TestName 'Replications'
     Services     = Get-DcDiagTestStatusFromOutput -Output $output -TestName 'Services'
@@ -381,24 +344,22 @@ function Invoke-DcDiagSummary {
     _raw         = $output
   }
 
-  # Se Replications falhou, tenta capturar o primeiro "error (####)" para ajudar na triagem
-  if ($result.Replications -eq 'Failed') {
+  if ($res.Replications -eq 'Failed') {
     if ($output -match '(?im)error\s+\((\d+)\)') {
-      $result.ReplicationErrorCode = $matches[1]
+      $res.ReplicationErrorCode = $matches[1]
     }
   }
 
-  # Indicadores clássicos de falha de contato (não inventa detalhes; apenas sinaliza ConnError)
   $lower = $output.ToLowerInvariant()
   if ($lower -match 'cannot be contacted|rpc server is unavailable|no longer available') {
-    $result._status = 'ConnError'
+    $res._status = 'ConnError'
   }
 
-  return $result
+  return $res
 }
 
 # ============================================================
-# 5) Status/cores e severidade geral do DC
+# 5) Status/cores e severidade geral
 # ============================================================
 
 function Get-StatusColor {
@@ -410,7 +371,6 @@ function Get-StatusColor {
     'Running'   { return 'ok' }
     'Passed'    { return 'ok' }
     'Open'      { return 'ok' }
-
     'NotTested' { return 'na' }
 
     'Failed'    { return 'fail' }
@@ -429,7 +389,6 @@ function Get-StatusColor {
 function Get-OverallStatus {
   param([Parameter(Mandatory)][pscustomobject]$Row)
 
-  # Se existe qualquer "Fail" forte => Failed
   $vals = @()
   foreach ($p in $Row.PSObject.Properties.Name) {
     if ($p -in @('Identity','OverallStatus','AnalystName','ClientName','ElapsedMs')) { continue }
@@ -442,28 +401,27 @@ function Get-OverallStatus {
 }
 
 # ============================================================
-# 6) Enumeração de DCs na floresta
+# 6) Enumeração de DCs (floresta atual)
 # ============================================================
 
 $StartDate = Get-Date
-Write-Host "Iniciando AD Health Check em $StartDate" -ForegroundColor Cyan
+Write-Host ("Iniciando AD Health Check em {0}" -f $StartDate) -ForegroundColor Cyan
 
 try {
   $forest = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
   $DCServers = $forest.Domains | ForEach-Object { $_.DomainControllers } | ForEach-Object { $_.Name }
   $ForestRoot = $forest.RootDomain.Name
-}
-catch {
+} catch {
   throw "Falha ao enumerar DCs: $($_.Exception.Message)"
 }
 
 $DCServers = $DCServers | Sort-Object -Unique
 if (-not $DCServers) { throw "Nenhum DC encontrado." }
 
-Write-Host "DCs encontrados: $($DCServers -join ', ')" -ForegroundColor DarkCyan
+Write-Host ("DCs encontrados: {0}" -f ($DCServers -join ', ')) -ForegroundColor DarkCyan
 
 # ============================================================
-# 7) Portas alvo (TCP/UDP)
+# 7) Portas
 # ============================================================
 
 $TcpPortsToCheck = [ordered]@{
@@ -485,56 +443,67 @@ $UdpPortsToCheck = [ordered]@{
 }
 
 # ============================================================
-# 8) Execução dos testes por DC
+# 8) Testes por DC + barra de progresso + validações
 # ============================================================
 
-$ResultsArr = foreach ($dcFqdn in $DCServers) {
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+$totalDCs = $DCServers.Count
+$index = 0
 
+$ResultsArr = foreach ($dcFqdn in $DCServers) {
+
+  $index++
+  $pctGlobal = [int](($index / $totalDCs) * 100)
+
+  Update-Progress -ParentId -1 -Id 0 -Activity "AD Health Check (PS 5.1)" `
+    -Status "Processando $dcFqdn ($index/$totalDCs)" -Percent $pctGlobal
+
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $short = To-ShortName -Fqdn $dcFqdn
 
-  # ---- Ping (usa FQDN e tenta shortname como fallback) ----
+  # ----- ETAPA 1: Ping -----
+  Update-Progress -ParentId 0 -Id 1 -Activity $dcFqdn -Status "Etapa 1/5: Conectividade (Ping)" -Percent 10
+  Write-Stage -Dc $dcFqdn -Message "Testando conectividade (Ping)..." -Color Cyan
+
   $pingOkFqdn  = Test-PingHost -ComputerName $dcFqdn -TimeoutSeconds 3
   $pingOkShort = $false
-  if (-not $pingOkFqdn) {
-    $pingOkShort = Test-PingHost -ComputerName $short -TimeoutSeconds 3
-  }
+  if (-not $pingOkFqdn) { $pingOkShort = Test-PingHost -ComputerName $short -TimeoutSeconds 3 }
 
   $pingOk = ($pingOkFqdn -or $pingOkShort)
   $pingStatus = if ($pingOk) { 'Success' } else { 'PingFail' }
-
-  # Target para consultas remotas: se shortname funcionou, usa ele; senão FQDN
   $target = if ($pingOkShort) { $short } else { $dcFqdn }
 
-  # ---- Serviços (WMI + fallback) ----
+  Write-Stage -Dc $dcFqdn -Message ("PingStatus = {0} (target={1})" -f $pingStatus, $target) -Color Gray
+
+  # ----- ETAPA 2: Serviços -----
+  Update-Progress -ParentId 0 -Id 1 -Activity $dcFqdn -Status "Etapa 2/5: Serviços (Netlogon/NTDS/DNS)" -Percent 30
+  Write-Stage -Dc $dcFqdn -Message "Validando serviços (WMI/sc.exe)..." -Color Cyan
+
   $netlogon = Get-ServiceStatusSafe -ComputerName $target -ServiceName 'Netlogon'
   $ntds     = Get-ServiceStatusSafe -ComputerName $target -ServiceName 'NTDS'
   $dnsSvc   = Get-ServiceStatusSafe -ComputerName $target -ServiceName 'DNS'
 
-  # ---- DCDIAG (1x) ----
-  $dcdiag = Invoke-DcDiagSummary -ComputerName $target -TimeoutSeconds $TimeoutSeconds
+  Write-Stage -Dc $dcFqdn -Message ("Netlogon={0} | NTDS={1} | DNS={2}" -f $netlogon, $ntds, $dnsSvc) -Color Gray
 
-  # ---- Shares ----
+  # ----- ETAPA 3: Shares + Portas -----
+  Update-Progress -ParentId 0 -Id 1 -Activity $dcFqdn -Status "Etapa 3/5: Shares (NETLOGON/SYSVOL) e Portas TCP/UDP" -Percent 55
+  Write-Stage -Dc $dcFqdn -Message "Validando shares e portas..." -Color Cyan
+
   $tNetlogonShare = Test-UncShare -ComputerName $target -ShareName 'NETLOGON'
   $tSysvolShare   = Test-UncShare -ComputerName $target -ShareName 'SYSVOL'
 
-  # ---- Portas TCP ----
   $tcpStatus = @{}
   foreach ($k in $TcpPortsToCheck.Keys) {
     $tcpStatus[$k] = Test-TcpPort -ComputerName $target -Port $TcpPortsToCheck[$k] -TimeoutSeconds 3
   }
 
-  # ---- Portas UDP ----
   $udpStatus = @{}
-
   foreach ($k in $UdpPortsToCheck.Keys) {
-    # DNS UDP: faz teste funcional via nslookup (UDP por padrão)
+
     if ($k -eq 'DNS_UDP') {
       $udpStatus[$k] = Test-DnsUdpFunctional -Name $target -Server $target
       continue
     }
 
-    # Kerberos/LDAP UDP: desabilitado por padrão (NotTested) para reduzir ruído
     if (($k -eq 'KerberosUDP' -or $k -eq 'LDAPUDP') -and -not $IncludeUdpLegacy) {
       $udpStatus[$k] = 'NotTested'
       continue
@@ -543,7 +512,12 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
     $udpStatus[$k] = Test-UdpPort -ComputerName $target -Port $UdpPortsToCheck[$k] -TimeoutSeconds 3
   }
 
-  # ---- DNS funcional usando o próprio DC como servidor ----
+  Write-Stage -Dc $dcFqdn -Message ("Shares: NETLOGON={0} | SYSVOL={1}" -f $tNetlogonShare, $tSysvolShare) -Color Gray
+
+  # ----- ETAPA 4: DNS funcional -----
+  Update-Progress -ParentId 0 -Id 1 -Activity $dcFqdn -Status "Etapa 4/5: DNS funcional (A/SRV/PTR)" -Percent 75
+  Write-Stage -Dc $dcFqdn -Message "Validando DNS (A/SRV/PTR) via servidor local do DC..." -Color Cyan
+
   $dnsA   = 'Unknown'
   $dnsSRV = 'Unknown'
   $dnsPTR = 'Unknown'
@@ -562,9 +536,20 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
     $dnsPTR = 'Unknown'
   }
 
+  Write-Stage -Dc $dcFqdn -Message ("DNS: A(Self)={0} | SRV(Forest)={1} | PTR(Self)={2}" -f $dnsA, $dnsSRV, $dnsPTR) -Color Gray
+
+  # ----- ETAPA 5: DCDIAG (1x) -----
+  Update-Progress -ParentId 0 -Id 1 -Activity $dcFqdn -Status "Etapa 5/5: DCDIAG (timeout real) + parse" -Percent 90
+  Write-Stage -Dc $dcFqdn -Message "Executando DCDIAG (1x)..." -Color Yellow
+
+  $dcdiag = Invoke-DcDiagSummary -ComputerName $target -TimeoutSeconds $TimeoutSeconds
+
+  Write-Stage -Dc $dcFqdn -Message ("DCDIAG: NetLogons={0} Replications={1} Services={2} Advertising={3} FSMOCheck={4}" -f `
+    $dcdiag.NetLogons, $dcdiag.Replications, $dcdiag.Services, $dcdiag.Advertising, $dcdiag.FSMOCheck) -Color Green
+
   $sw.Stop()
 
-  # ---- Montagem do objeto final (uma linha por DC) ----
+  # ----- Resultado final por DC -----
   $row = [pscustomobject]@{
     Identity             = $dcFqdn
     PingStatus           = $pingStatus
@@ -609,12 +594,17 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
     ClientName           = $ClientName
   }
 
-  # Status geral do DC para triagem rápida (OK / Warn / Failed)
-  $overall = Get-OverallStatus -Row $row
-  $row | Add-Member -NotePropertyName OverallStatus -NotePropertyValue $overall
+  $row | Add-Member -NotePropertyName OverallStatus -NotePropertyValue (Get-OverallStatus -Row $row)
+
+  Update-Progress -ParentId 0 -Id 1 -Activity $dcFqdn -Status "Concluído" -Percent 100
+  Complete-Progress -Id 1
+
+  Write-Stage -Dc $dcFqdn -Message ("Finalizado. OverallStatus={0} | ElapsedMs={1}" -f $row.OverallStatus, $row.ElapsedMs) -Color Magenta
 
   $row
 }
+
+Complete-Progress -Id 0
 
 $ResultsArr = $ResultsArr | Sort-Object Identity
 
@@ -626,20 +616,14 @@ if ($ExportCsv) {
   try {
     $ResultsArr | Export-Csv -NoTypeInformation -Path $ExportCsv -Encoding UTF8
     Write-Host "Export CSV: $((Resolve-Path -LiteralPath $ExportCsv).Path)" -ForegroundColor Green
-  }
-  catch {
-    Write-Warning "CSV: $($_.Exception.Message)"
-  }
+  } catch { Write-Warning "CSV: $($_.Exception.Message)" }
 }
 
 if ($ExportJson) {
   try {
     $ResultsArr | ConvertTo-Json -Depth 6 | Out-File -FilePath $ExportJson -Encoding UTF8
     Write-Host "Export JSON: $((Resolve-Path -LiteralPath $ExportJson).Path)" -ForegroundColor Green
-  }
-  catch {
-    Write-Warning "JSON: $($_.Exception.Message)"
-  }
+  } catch { Write-Warning "JSON: $($_.Exception.Message)" }
 }
 
 # ============================================================
@@ -647,7 +631,6 @@ if ($ExportJson) {
 # ============================================================
 
 $EndDate = Get-Date
-
 $total = $ResultsArr.Count
 $failCount = ($ResultsArr | Where-Object { $_.OverallStatus -eq 'Failed' }).Count
 $warnCount = ($ResultsArr | Where-Object { $_.OverallStatus -eq 'Warn' }).Count
@@ -792,33 +775,13 @@ $rows = foreach ($r in $ResultsArr) {
   $cells += "<td class='$clsOverall'><b>$($r.OverallStatus)</b></td>"
 
   foreach ($p in @(
-    'PingStatus',
-    'NetlogonService',
-    'NTDSService',
-    'DNSServiceStatus',
-    'NetlogonsTest',
-    'ReplicationTest',
-    'ReplicationErrorCode',
-    'ServicesTest',
-    'AdvertisingTest',
-    'FSMOCheckTest',
-    'NETLOGONTest',
-    'SYSVOLTest',
-    'KerberosTCP',
-    'LDAPTCP',
-    'LDAPS',
-    'GCLDAP',
-    'GCLDAPS',
-    'DNS_TCP',
-    'DNS_UDP',
-    'DNS_A_Self',
-    'DNS_SRV_Forest',
-    'DNS_PTR_Self',
-    'NTLM_RPC135',
-    'NTLM_139',
-    'NTLM_445',
-    'KerberosUDP',
-    'LDAPUDP',
+    'PingStatus','NetlogonService','NTDSService','DNSServiceStatus',
+    'NetlogonsTest','ReplicationTest','ReplicationErrorCode','ServicesTest','AdvertisingTest','FSMOCheckTest',
+    'NETLOGONTest','SYSVOLTest',
+    'KerberosTCP','LDAPTCP','LDAPS','GCLDAP','GCLDAPS',
+    'DNS_TCP','DNS_UDP','DNS_A_Self','DNS_SRV_Forest','DNS_PTR_Self',
+    'NTLM_RPC135','NTLM_139','NTLM_445',
+    'KerberosUDP','LDAPUDP',
     'ElapsedMs'
   )) {
     $val = [string]$r.$p
@@ -845,23 +808,20 @@ $htmlFooter = @"
 </html>
 "@
 
-# Salvar HTML com criação de pasta se necessário
 try {
   $dir = Split-Path -Path $OutputPath -Parent
   if ($dir -and -not (Test-Path -LiteralPath $dir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
   }
-
   ($htmlHeader + ($rows -join "`n") + $htmlFooter) | Out-File -FilePath $OutputPath -Encoding UTF8 -Force
   $resolved = Resolve-Path -LiteralPath $OutputPath -ErrorAction Stop
   Write-Host ("Relatório HTML salvo em: {0}" -f $resolved.Path) -ForegroundColor Green
-}
-catch {
+} catch {
   Write-Warning "Falha ao salvar HTML: $($_.Exception.Message)"
 }
 
 # ============================================================
-# 11) Email opcional (PS 5.1)
+# 11) E-mail opcional
 # ============================================================
 
 if ($SmtpHost -and $EmailTo) {
@@ -870,18 +830,14 @@ if ($SmtpHost -and $EmailTo) {
     if ($to.Count -gt 0) {
       $body = Get-Content -LiteralPath $OutputPath -Raw -Encoding UTF8
       $subject = "AD Health Monitor - $ClientName - $($StartDate.ToString('yyyy-MM-dd HH:mm'))"
-
       Send-MailMessage -SmtpServer $SmtpHost -Port $SmtpPort -UseSsl:$UseSsl `
         -From $EmailFrom -To $to -Subject $subject -Body $body -BodyAsHtml -ErrorAction Stop
-
       Write-Host "E-mail enviado para: $($to -join ', ')" -ForegroundColor Green
     }
-  }
-  catch {
+  } catch {
     Write-Warning "Falha ao enviar e-mail: $($_.Exception.Message)"
   }
-}
-else {
+} else {
   Write-Host "Envio de e-mail não configurado (SmtpHost ou EmailTo ausentes)." -ForegroundColor Yellow
 }
 
