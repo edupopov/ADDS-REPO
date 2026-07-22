@@ -33,41 +33,40 @@ Este repositório contempla conteúdos relacionados a:
 - Inventário, auditoria e limpeza de objetos obsoletos.
 
 ---
+## Training and Certifications
+## Microsoft Training
 
-## Estrutura sugerida do repositório
+Active Directory Domain Services / Windows Server (ADDS)
+https://learn.microsoft.com/en-us/training/paths/active-directory-domain-services/
+https://learn.microsoft.com/en-us/training/paths/administer-active-directory-domain-services/
+https://learn.microsoft.com/en-us/training/paths/deploy-manage-identity-infrastructure/
 
-```text
-/
-├── README.md
-├── scripts/
-│   ├── checks/
-│   ├── users/
-│   ├── groups/
-│   ├── computers/
-│   ├── ous/
-│   ├── gpo/
-│   ├── replication/
-│   ├── security/
-│   └── reports/
-├── docs/
-│   ├── procedures/
-│   ├── standards/
-│   ├── troubleshooting/
-│   └── architecture/
-├── templates/
-│   ├── ou-structure/
-│   ├── group-naming/
-│   └── access-review/
-├── training/
-│   ├── microsoft-learn/
-│   ├── internal-materials/
-│   └── labs/
-└── references/
-    ├── official-docs.md
-    ├── useful-links.md
-    └── recommended-reading.md
+## Entra ID
+https://learn.microsoft.com/en-us/training/entra/
+https://learn.microsoft.com/en-us/training/paths/manage-identity-and-access/
+https://learn.microsoft.com/en-us/training/paths/describe-capabilities-of-microsoft-identity-access/
+https://learn.microsoft.com/en-us/training/modules/explore-identity-azure-active-directory/
+https://learn.microsoft.com/en-us/training/paths/az-400-develop-security-compliance-plan/
+Active Directory Certificate Services (ADCS)
+https://learn.microsoft.com/en-us/training/modules/implement-manage-active-directory-certificate-services/
+Microsoft Certifications
+
+## Microsoft Certified: Windows Server Hybrid Administrator
+NOTE: THESE ARE BEING RETIRED IN SEPTEMBER 2026! New AZ-802 is replacing them!
+https://learn.microsoft.com/en-us/credentials/certifications/windows-server-hybrid-administrator/
+https://learn.microsoft.com/en-us/credentials/certifications/exams/az-800/
+https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/az-800
+https://learn.microsoft.com/en-us/credentials/certifications/exams/az-801/
+https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/az-801
+Microsoft Certified: Identity and Access Administrator Associate
+https://learn.microsoft.com/en-us/credentials/certifications/identity-and-access-administrator/?practice-assessment-type=certification
+https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/sc-300
+Microsoft Certified: Azure Security Engineer Associate [AZ-500]:
+* NOTE: THIS IS BEING RETIRED IN 2026! New SC-500 is replacing it.
+https://learn.microsoft.com/en-us/credentials/certifications/azure-security-engineer/?practice-assessment-type=certification
+Applied Skills (Mini certifications)
+Administer Active Directory Domain Services: https://learn.microsoft.com/en-us/credentials/applied-skills/administer-active-directory-domain-services/
 ```
-
 ---
 
 ## Categorias de scripts
