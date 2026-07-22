@@ -3,9 +3,7 @@
 Este repositório centraliza scripts, procedimentos, consultas, referências técnicas e materiais de apoio relacionados à administração, verificação, organização e governança de ambientes **Active Directory Domain Services (AD DS)**.
 
 O objetivo é manter uma base organizada, reutilizável e tecnicamente confiável para apoiar atividades de operação, auditoria, troubleshooting, padronização de estruturas e capacitação técnica.
-
 ---
-
 ## Objetivos do repositório
 
 - Disponibilizar scripts para checagem e validação do ambiente Active Directory.
@@ -13,7 +11,6 @@ O objetivo é manter uma base organizada, reutilizável e tecnicamente confiáve
 - Centralizar links de documentação oficial, artigos técnicos e treinamentos relacionados a AD DS.
 - Facilitar atividades de auditoria, segurança, governança de identidade e revisão operacional.
 - Servir como base de conhecimento para times de infraestrutura, segurança, suporte e administração de identidade.
-
 ---
 
 ## Escopo
@@ -34,34 +31,38 @@ Este repositório contempla conteúdos relacionados a:
 
 ---
 ## Training and Certifications
+
 ## Microsoft Training
 
-Active Directory Domain Services / Windows Server (ADDS)
-https://learn.microsoft.com/en-us/training/paths/active-directory-domain-services/
-https://learn.microsoft.com/en-us/training/paths/administer-active-directory-domain-services/
-https://learn.microsoft.com/en-us/training/paths/deploy-manage-identity-infrastructure/
+## Active Directory Domain Services / Windows Server (ADDS)
+1. https://learn.microsoft.com/en-us/training/paths/active-directory-domain-services/
+2. https://learn.microsoft.com/en-us/training/paths/administer-active-directory-domain-services/
+3. https://learn.microsoft.com/en-us/training/paths/deploy-manage-identity-infrastructure/
+4. https://learn.microsoft.com/en-us/credentials/applied-skills/administer-active-directory-domain-services/
 
 ## Entra ID
-https://learn.microsoft.com/en-us/training/entra/
-https://learn.microsoft.com/en-us/training/paths/manage-identity-and-access/
-https://learn.microsoft.com/en-us/training/paths/describe-capabilities-of-microsoft-identity-access/
-https://learn.microsoft.com/en-us/training/modules/explore-identity-azure-active-directory/
-https://learn.microsoft.com/en-us/training/paths/az-400-develop-security-compliance-plan/
-Active Directory Certificate Services (ADCS)
-https://learn.microsoft.com/en-us/training/modules/implement-manage-active-directory-certificate-services/
-Microsoft Certifications
+1. https://learn.microsoft.com/en-us/training/entra/
+2. https://learn.microsoft.com/en-us/training/paths/manage-identity-and-access/
+3. https://learn.microsoft.com/en-us/training/paths/describe-capabilities-of-microsoft-identity-access/
+4. https://learn.microsoft.com/en-us/training/modules/explore-identity-azure-active-directory/
+5. https://learn.microsoft.com/en-us/training/paths/az-400-develop-security-compliance-plan/
+6. Active Directory Certificate Services (ADCS)
+7. https://learn.microsoft.com/en-us/training/modules/implement-manage-active-directory-certificate-services/
+8. Microsoft Certifications
 
 ## Microsoft Certified: Windows Server Hybrid Administrator
 NOTE: THESE ARE BEING RETIRED IN SEPTEMBER 2026! New AZ-802 is replacing them!
-https://learn.microsoft.com/en-us/credentials/certifications/windows-server-hybrid-administrator/
-https://learn.microsoft.com/en-us/credentials/certifications/exams/az-800/
-https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/az-800
-https://learn.microsoft.com/en-us/credentials/certifications/exams/az-801/
-https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/az-801
-Microsoft Certified: Identity and Access Administrator Associate
-https://learn.microsoft.com/en-us/credentials/certifications/identity-and-access-administrator/?practice-assessment-type=certification
-https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/sc-300
-Microsoft Certified: Azure Security Engineer Associate [AZ-500]:
+
+1. https://learn.microsoft.com/en-us/credentials/certifications/windows-server-hybrid-administrator/
+2. https://learn.microsoft.com/en-us/credentials/certifications/exams/az-800/
+3. https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/az-800
+4. https://learn.microsoft.com/en-us/credentials/certifications/exams/az-801/
+5. https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/az-801
+6. Microsoft Certified: Identity and Access Administrator Associate
+7. https://learn.microsoft.com/en-us/credentials/certifications/identity-and-access-administrator/?practice-assessment-type=certification
+8. https://learn.microsoft.com/en-us/credentials/certifications/resources/study-guides/sc-300
+
+## Microsoft Certified: Azure Security Engineer Associate [AZ-500]:
 * NOTE: THIS IS BEING RETIRED IN 2026! New SC-500 is replacing it.
 https://learn.microsoft.com/en-us/credentials/certifications/azure-security-engineer/?practice-assessment-type=certification
 Applied Skills (Mini certifications)
@@ -172,32 +173,13 @@ Exemplo de cabeçalho sugerido:
     Informar pré-requisitos, permissões necessárias e eventuais riscos operacionais.
 #>
 ```
-
 ---
 
 ## Convenção sugerida de nomes
 
 Para manter o repositório organizado, recomenda-se utilizar nomes objetivos e padronizados.
 
-### Scripts
-
-```text
-Get-ADInactiveUsers.ps1
-Get-ADDisabledComputers.ps1
-New-ADOUStructure.ps1
-Export-ADPrivilegedGroups.ps1
-Test-ADReplicationHealth.ps1
 ```
-
-### Documentos
-
-```text
-procedure-ad-user-cleanup.md
-standard-ou-structure.md
-troubleshooting-ad-replication.md
-security-review-privileged-groups.md
-```
-
 ---
 
 ## Fluxo recomendado de contribuição
@@ -265,8 +247,6 @@ Recomendações obrigatórias:
 
 ---
 
-## Links oficiais e treinamentos recomendados
-
 ### Microsoft Learn
 
 - [Active Directory Domain Services - Training](https://learn.microsoft.com/pt-br/training/paths/active-directory-domain-services/)
@@ -288,40 +268,3 @@ Recomendações obrigatórias:
 - Monitoramento e manutenção do diretório.
 - Integração com ambientes híbridos.
 
----
-
-## Política de uso
-
-Os scripts e documentos deste repositório devem ser utilizados com responsabilidade técnica. Qualquer execução em ambiente produtivo deve observar os processos internos de mudança, governança, segurança e aprovação.
-
-Este repositório não substitui a análise técnica do ambiente nem dispensa validações prévias antes da execução de comandos administrativos.
-
----
-
-## Manutenção do repositório
-
-Recomenda-se revisar periodicamente:
-
-- Scripts obsoletos.
-- Links quebrados.
-- Documentação desatualizada.
-- Procedimentos que não refletem mais o ambiente atual.
-- Permissões de acesso ao repositório.
-- Evidências e exemplos antigos.
-
----
-
-## Referências
-
-- Microsoft Learn: [Active Directory Domain Services - Training](https://learn.microsoft.com/pt-br/training/paths/active-directory-domain-services/)
-- Microsoft Learn: [Administer Active Directory Domain Services](https://learn.microsoft.com/en-us/training/paths/administer-active-directory-domain-services/)
-- Microsoft Learn: [Windows Server documentation](https://learn.microsoft.com/windows-server/)
-- Microsoft Learn: [Group Policy overview](https://learn.microsoft.com/windows-server/identity/ad-ds/manage/group-policy/group-policy-overview)
-
----
-
-## Licença e responsabilidade
-
-Defina neste espaço a licença de uso do repositório, quando aplicável.
-
-Os responsáveis pelo repositório devem garantir que scripts com impacto operacional sejam revisados, testados e documentados antes da utilização em produção.
