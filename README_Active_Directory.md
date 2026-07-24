@@ -2,6 +2,8 @@
 
 Este repositório centraliza scripts, procedimentos, consultas, referências técnicas e materiais de apoio relacionados à administração, verificação, organização e governança de ambientes **Active Directory Domain Services (AD DS)**.
 
+Foi criado por Eduardo Popovici [MCT|MVP] para contribuir com a comunidade técnica. 
+
 O objetivo é manter uma base organizada, reutilizável e tecnicamente confiável para apoiar atividades de operação, auditoria, troubleshooting, padronização de estruturas e capacitação técnica.
 ---
 ## Objetivos do repositório
@@ -46,9 +48,11 @@ Este repositório contempla conteúdos relacionados a:
 3. https://learn.microsoft.com/en-us/training/paths/describe-capabilities-of-microsoft-identity-access/
 4. https://learn.microsoft.com/en-us/training/modules/explore-identity-azure-active-directory/
 5. https://learn.microsoft.com/en-us/training/paths/az-400-develop-security-compliance-plan/
-6. Active Directory Certificate Services (ADCS)
-7. https://learn.microsoft.com/en-us/training/modules/implement-manage-active-directory-certificate-services/
-8. Microsoft Certifications
+
+Active Directory Certificate Services (ADCS)
+1. https://learn.microsoft.com/en-us/training/modules/implement-manage-active-directory-certificate-services/
+
+## Microsoft Certifications
 
 ## Microsoft Certified: Windows Server Hybrid Administrator
 NOTE: THESE ARE BEING RETIRED IN SEPTEMBER 2026! New AZ-802 is replacing them!
