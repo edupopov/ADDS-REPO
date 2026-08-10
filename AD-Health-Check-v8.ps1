@@ -1,5 +1,5 @@
 <# 
-AD Health Check – PS 5.1/7 – Layout v7
+AD Health Check – PS 5.1/7 – Layout v8
 - Criado por Eduardo Popovici e disponível em seu repositório GitHub
 - Script criado e disponibilizado para a comunidade Microsoft
 - Ping via ping.exe
@@ -15,6 +15,9 @@ AD Health Check – PS 5.1/7 – Layout v7
 - Rede por DC: quantidade de interfaces IP habilitadas, endereços IPv4/IPv6, prefixo CIDR e DNS configurado por interface
 - Replicação detalhada: parceiro inbound, partição, última tentativa, último sucesso, resultado e falhas consecutivas
 - Sincronismo de horário: serviço W32Time, fonte atual, último sincronismo, stratum, hora do servidor e identificação do PDC Emulator
+- SYSVOL / DFSR: DCDiag SysVolCheck e DFSREvent, serviço DFSR, estado operacional do SYSVOL Share, Content Freshness e eventos relevantes
+- SYSVOL backlog: pendências entre parceiros de replicação detectados
+- Consistência de GPOs no SYSVOL: diretórios GUID, presença e hash SHA256 do GPT.INI entre DCs do mesmo domínio
 #>
 
 [CmdletBinding()]
@@ -127,7 +130,7 @@ $script:DcDiagDetails = @{}
 function Invoke-DcDiagTest {
   param(
     [Parameter(Mandatory)][string]$ComputerName,
-    [Parameter(Mandatory)][ValidateSet('Netlogons','Replications','Services','Advertising','FSMOCheck')] [string]$TestName,
+    [Parameter(Mandatory)][ValidateSet('Netlogons','Replications','Services','Advertising','FSMOCheck','SysVolCheck','DFSREvent')] [string]$TestName,
     [int]$Timeout=180
   )
 
@@ -258,6 +261,341 @@ function Get-RemoteCimDataSafe {
   }
 
   return @()
+}
+
+function Get-RemoteCimNamespaceDataSafe {
+  param(
+    [Parameter(Mandatory)][string]$ComputerName,
+    [Parameter(Mandatory)][string]$Namespace,
+    [Parameter(Mandatory)][string]$ClassName,
+    [string]$Filter
+  )
+
+  # Consulta namespaces WMI/CIM específicos (por exemplo root\microsoftdfs),
+  # priorizando DCOM para não exigir WinRM nos Domain Controllers.
+  if ((Get-Command New-CimSession -ErrorAction SilentlyContinue) -and
+      (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+    $session = $null
+    try {
+      $sessionOption = New-CimSessionOption -Protocol Dcom
+      $session = New-CimSession -ComputerName $ComputerName -SessionOption $sessionOption -ErrorAction Stop
+      if ($Filter) {
+        return @(Get-CimInstance -Namespace $Namespace -ClassName $ClassName -Filter $Filter -CimSession $session -ErrorAction Stop)
+      }
+      return @(Get-CimInstance -Namespace $Namespace -ClassName $ClassName -CimSession $session -ErrorAction Stop)
+    } catch {
+      # Fallback abaixo.
+    } finally {
+      if ($session) { try { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue } catch {} }
+    }
+  }
+
+  if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+    try {
+      if ($Filter) {
+        return @(Get-WmiObject -Namespace $Namespace -Class $ClassName -Filter $Filter -ComputerName $ComputerName -ErrorAction Stop)
+      }
+      return @(Get-WmiObject -Namespace $Namespace -Class $ClassName -ComputerName $ComputerName -ErrorAction Stop)
+    } catch {}
+  }
+
+  if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+    try {
+      if ($Filter) {
+        return @(Get-CimInstance -Namespace $Namespace -ClassName $ClassName -Filter $Filter -ComputerName $ComputerName -ErrorAction Stop)
+      }
+      return @(Get-CimInstance -Namespace $Namespace -ClassName $ClassName -ComputerName $ComputerName -ErrorAction Stop)
+    } catch {}
+  }
+
+  return @()
+}
+
+function Convert-DfsrStateLabel {
+  param($State)
+
+  if ($null -eq $State -or [string]::IsNullOrWhiteSpace([string]$State)) { return 'Unknown' }
+  switch ([int]$State) {
+    0 { 'Uninitialized (0)' }
+    1 { 'Initialized (1)' }
+    2 { 'Initial Sync (2)' }
+    3 { 'Auto Recovery (3)' }
+    4 { 'Normal (4)' }
+    5 { 'In Error (5)' }
+    default { "Unknown ($State)" }
+  }
+}
+
+function Get-DfsrRecentEventsSafe {
+  param(
+    [Parameter(Mandatory)][string]$ComputerName,
+    [int]$Hours = 24
+  )
+
+  $rows = @()
+  $queryError = ''
+  $startTime = (Get-Date).AddHours(-1 * [math]::Abs($Hours))
+  $importantIds = @(2213,2214,4012,4114,4144,4602,4604,4614,5002,5008,5014)
+
+  if (Get-Command Get-WinEvent -ErrorAction SilentlyContinue) {
+    try {
+      # Limita a leitura para evitar relatórios excessivamente grandes em ambientes com muitos eventos.
+      $events = @(
+        Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{ LogName='DFS Replication'; StartTime=$startTime } -MaxEvents 200 -ErrorAction Stop
+      )
+
+      foreach ($evt in $events) {
+        $levelText = [string]$evt.LevelDisplayName
+        $isWarnOrError = ($evt.Level -eq 2 -or $evt.Level -eq 3)
+        if (-not $isWarnOrError -and ($importantIds -notcontains [int]$evt.Id)) { continue }
+
+        $message = ''
+        try { $message = ([string]$evt.Message).Trim() -replace '\r?\n', ' ' } catch {}
+        if ($message.Length -gt 500) { $message = $message.Substring(0,500) + '...' }
+
+        $rows += [pscustomobject]@{
+          Id        = [int]$evt.Id
+          Level     = if ($levelText) { $levelText } else { [string]$evt.Level }
+          Time      = if ($evt.TimeCreated) { ([datetime]$evt.TimeCreated).ToString('dd/MM/yyyy HH:mm:ss') } else { 'Unknown' }
+          Message   = $message
+          IsCritical = ([int]$evt.Id -in @(2213,4012))
+        }
+      }
+    } catch {
+      $queryError = $_.Exception.Message
+    }
+  } else {
+    $queryError = 'Get-WinEvent não está disponível.'
+  }
+
+  [pscustomobject]@{
+    Count      = if ($queryError) { 'Unknown' } else { $rows.Count }
+    CriticalCount = @($rows | Where-Object { $_.IsCritical }).Count
+    QueryError = $queryError
+    Events     = @($rows)
+  }
+}
+
+function Get-SysvolDfsrInfoSafe {
+  param([Parameter(Mandatory)][string]$ComputerName)
+
+  $serviceStatus = Get-ServiceStatusSafe -ComputerName $ComputerName -ServiceName 'DFSR'
+  $stateNumber = $null
+  $stateLabel = 'Unknown'
+  $stateDetail = ''
+  $maxOfflineDays = 'Unknown'
+  $contentFreshness = 'Unknown'
+
+  try {
+    $folderInfo = @(
+      Get-RemoteCimNamespaceDataSafe -ComputerName $ComputerName -Namespace 'root\microsoftdfs' -ClassName 'DfsrReplicatedFolderInfo' -Filter "ReplicatedFolderName='SYSVOL Share'"
+    ) | Select-Object -First 1
+
+    if ($folderInfo) {
+      $stateNumber = $folderInfo.State
+      $stateLabel = Convert-DfsrStateLabel -State $stateNumber
+      try {
+        if ($folderInfo.ReplicationGroupName) {
+          $stateDetail = "Grupo: $([string]$folderInfo.ReplicationGroupName)"
+        }
+      } catch {}
+    } else {
+      $stateDetail = 'Nenhuma instância DfsrReplicatedFolderInfo para SYSVOL Share foi retornada.'
+    }
+  } catch {
+    $stateDetail = $_.Exception.Message
+  }
+
+  try {
+    $machineConfig = @(
+      Get-RemoteCimNamespaceDataSafe -ComputerName $ComputerName -Namespace 'root\microsoftdfs' -ClassName 'DfsrMachineConfig'
+    ) | Select-Object -First 1
+
+    if ($machineConfig -and $null -ne $machineConfig.MaxOfflineTimeInDays) {
+      $maxOfflineDays = [string]$machineConfig.MaxOfflineTimeInDays
+      if ([int]$machineConfig.MaxOfflineTimeInDays -eq 0) {
+        $contentFreshness = 'Desabilitado (0 dias)'
+      } else {
+        $contentFreshness = "Habilitado ($($machineConfig.MaxOfflineTimeInDays) dias)"
+      }
+    }
+  } catch {}
+
+  $eventInfo = Get-DfsrRecentEventsSafe -ComputerName $ComputerName -Hours 24
+
+  [pscustomobject]@{
+    ServiceStatus          = $serviceStatus
+    StateNumber            = $stateNumber
+    StateLabel             = $stateLabel
+    StateDetail            = $stateDetail
+    MaxOfflineTimeInDays   = $maxOfflineDays
+    ContentFreshness       = $contentFreshness
+    RecentEventCount       = $eventInfo.Count
+    CriticalEventCount     = $eventInfo.CriticalCount
+    EventQueryError        = $eventInfo.QueryError
+    RecentEvents           = $eventInfo.Events
+  }
+}
+
+function Get-SysvolGpoInventorySafe {
+  param(
+    [Parameter(Mandatory)][string]$ComputerName,
+    [Parameter(Mandatory)][string]$DomainName
+  )
+
+  $entries = @()
+  $queryError = ''
+  $policiesPath = "\\$ComputerName\SYSVOL\$DomainName\Policies"
+
+  try {
+    $folders = @(
+      Get-ChildItem -LiteralPath $policiesPath -Directory -ErrorAction Stop |
+        Where-Object { $_.Name -match '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$' } |
+        Sort-Object Name
+    )
+
+    foreach ($folder in $folders) {
+      $gptIni = Join-Path $folder.FullName 'GPT.INI'
+      $gptPresent = $false
+      $hash = 'Missing'
+      $version = 'Unknown'
+
+      try { $gptPresent = Test-Path -LiteralPath $gptIni -PathType Leaf -ErrorAction SilentlyContinue } catch {}
+      if ($gptPresent) {
+        try {
+          if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+            $hash = (Get-FileHash -LiteralPath $gptIni -Algorithm SHA256 -ErrorAction Stop).Hash
+          } else {
+            $bytes = [System.IO.File]::ReadAllBytes($gptIni)
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try { $hash = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','') } finally { $sha.Dispose() }
+          }
+        } catch { $hash = 'HashError' }
+
+        try {
+          $versionLine = Get-Content -LiteralPath $gptIni -ErrorAction Stop | Where-Object { $_ -match '^\s*Version\s*=' } | Select-Object -First 1
+          if ($versionLine -and $versionLine -match '=\s*(\d+)') { $version = $Matches[1] }
+        } catch {}
+      }
+
+      $entries += [pscustomobject]@{
+        Guid       = $folder.Name.ToUpperInvariant()
+        GptPresent = $gptPresent
+        GptHash    = $hash
+        Version    = $version
+      }
+    }
+  } catch {
+    $queryError = $_.Exception.Message
+  }
+
+  [pscustomobject]@{
+    Domain       = $DomainName
+    PoliciesPath = $policiesPath
+    GpoCount     = $entries.Count
+    QueryError   = $queryError
+    Entries      = @($entries)
+  }
+}
+
+function Resolve-DomainFromDcFqdn {
+  param([string]$DcName)
+  if ([string]::IsNullOrWhiteSpace($DcName)) { return 'Unknown' }
+  if ($DcName -match '^[^.]+\.(.+)$') { return $Matches[1] }
+  return 'Unknown'
+}
+
+function Resolve-KnownDcName {
+  param(
+    [string]$Name,
+    [string[]]$KnownDcs
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+  $short = ($Name -split '\.')[0]
+  foreach ($dc in $KnownDcs) {
+    if ($dc -ieq $Name -or (($dc -split '\.')[0] -ieq $short)) { return $dc }
+  }
+  return $null
+}
+
+function Get-SysvolBacklogSafe {
+  param(
+    [Parameter(Mandatory)][string]$SourceComputerName,
+    [Parameter(Mandatory)][string]$DestinationComputerName
+  )
+
+  $sourceShort = ($SourceComputerName -split '\.')[0]
+  $destinationShort = ($DestinationComputerName -split '\.')[0]
+  $countDisplay = 'Unknown'
+  $status = 'Unknown'
+  $detail = ''
+  $method = 'Unavailable'
+
+  if (-not (Get-Command Get-DfsrBacklog -ErrorAction SilentlyContinue)) {
+    try { Import-Module DFSR -ErrorAction Stop } catch {}
+  }
+
+  if (Get-Command Get-DfsrBacklog -ErrorAction SilentlyContinue) {
+    try {
+      $items = @(
+        Get-DfsrBacklog -GroupName 'Domain System Volume' -FolderName 'SYSVOL Share' -SourceComputerName $sourceShort -DestinationComputerName $destinationShort -ErrorAction Stop
+      )
+      $method = 'Get-DfsrBacklog'
+      if ($items.Count -ge 100) { $countDisplay = '100+' } else { $countDisplay = [string]$items.Count }
+      if ($items.Count -eq 0) {
+        $status = 'OK'
+        $detail = 'Nenhuma atualização pendente retornada.'
+      } else {
+        $status = 'Aviso'
+        $detail = if ($items.Count -ge 100) { 'Há pelo menos 100 atualizações pendentes; o cmdlet limita a listagem a 100 itens.' } else { 'Há atualizações pendentes de replicação.' }
+      }
+    } catch {
+      $detail = $_.Exception.Message
+    }
+  }
+
+  if ($method -eq 'Unavailable' -or ($countDisplay -eq 'Unknown' -and $detail)) {
+    $dfsrdiag = Join-Path $env:SystemRoot 'System32\dfsrdiag.exe'
+    if (-not (Test-Path -LiteralPath $dfsrdiag)) {
+      $cmd = Get-Command dfsrdiag.exe -ErrorAction SilentlyContinue
+      if ($cmd) { $dfsrdiag = $cmd.Source }
+    }
+
+    if ($dfsrdiag -and (Test-Path -LiteralPath $dfsrdiag)) {
+      $args = ('backlog /rgname:"Domain System Volume" /rfname:"SYSVOL Share" /smem:{0} /rmem:{1}' -f $sourceShort,$destinationShort)
+      $result = Invoke-ExternalCommandCaptureSafe -FilePath $dfsrdiag -Arguments $args -TimeoutSeconds 60
+      $method = 'dfsrdiag backlog'
+      if ($result.Success) {
+        if ($result.Output -match '(?i)Backlog\s+File\s+Count\s*:\s*(\d+)') {
+          $countDisplay = $Matches[1]
+          if ([int]$Matches[1] -eq 0) { $status='OK'; $detail='Nenhuma atualização pendente.' }
+          else { $status='Aviso'; $detail='Há atualizações pendentes de replicação.' }
+        } elseif ($result.Output -match '(?i)no\s+backlog|backlog.*0') {
+          $countDisplay = '0'; $status='OK'; $detail='Nenhuma atualização pendente.'
+        } else {
+          $status = 'Unknown'
+          $detail = if ($result.Output) { ($result.Output -replace '\r?\n',' ').Trim() } else { 'Comando executado sem contagem interpretável.' }
+        }
+      } else {
+        $status = 'Unknown'
+        $detail = if ($result.Output) { ($result.Output -replace '\r?\n',' ').Trim() } else { 'Falha ao executar dfsrdiag backlog.' }
+      }
+    } elseif (-not $detail) {
+      $detail = 'Módulo DFSR e dfsrdiag.exe não estão disponíveis.'
+    }
+  }
+
+  if ($detail.Length -gt 500) { $detail = $detail.Substring(0,500) + '...' }
+
+  [pscustomobject]@{
+    Source      = $SourceComputerName
+    Destination = $DestinationComputerName
+    Count       = $countDisplay
+    Status      = $status
+    Detail      = $detail
+    Method      = $method
+  }
 }
 
 function Get-ServerInventorySafe {
@@ -993,10 +1331,20 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
   # Sincronismo de horário / Windows Time
   $timeInfo = Get-TimeSyncInfoSafe -ComputerName $target -IsPdcEmulator $isPdcEmulator
 
+  # SYSVOL / DFSR e inventário de GPOs no compartilhamento SYSVOL.
+  $dcDomainName = Resolve-DomainFromDcFqdn -DcName $dcFqdn
+  $sysvolDfsrInfo = Get-SysvolDfsrInfoSafe -ComputerName $target
+  $sysvolGpoInfo = if ($dcDomainName -ne 'Unknown') {
+    Get-SysvolGpoInventorySafe -ComputerName $target -DomainName $dcDomainName
+  } else {
+    [pscustomobject]@{ Domain='Unknown'; PoliciesPath='Unknown'; GpoCount=0; QueryError='Não foi possível identificar o domínio do DC.'; Entries=@() }
+  }
+
   # Serviços
   $netlogon = Get-ServiceStatusSafe -ComputerName $target -ServiceName 'Netlogon'
   $ntds     = Get-ServiceStatusSafe -ComputerName $target -ServiceName 'NTDS'
   $dnsSvc   = Get-ServiceStatusSafe -ComputerName $target -ServiceName 'DNS'
+  $dfsrSvc  = $sysvolDfsrInfo.ServiceStatus
 
   # dcdiag
   $tNetlogons   = Invoke-DcDiagTest -ComputerName $target -TestName 'Netlogons'    -Timeout $TimeoutSeconds
@@ -1004,6 +1352,8 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
   $tServices    = Invoke-DcDiagTest -ComputerName $target -TestName 'Services'     -Timeout $TimeoutSeconds
   $tAdvertising = Invoke-DcDiagTest -ComputerName $target -TestName 'Advertising'  -Timeout $TimeoutSeconds
   $tFSMO        = Invoke-DcDiagTest -ComputerName $target -TestName 'FSMOCheck'    -Timeout $TimeoutSeconds
+  $tSysVolCheck = Invoke-DcDiagTest -ComputerName $target -TestName 'SysVolCheck'  -Timeout $TimeoutSeconds
+  $tDFSREvent   = Invoke-DcDiagTest -ComputerName $target -TestName 'DFSREvent'    -Timeout $TimeoutSeconds
 
   # Shares
   $tNetlogonShare = Test-UncShare -ComputerName $target -ShareName 'NETLOGON'
@@ -1047,6 +1397,39 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
     }
   } catch { $dnsPTR = 'Failed' }
 
+  # Consolida um estado específico do SYSVOL. Backlog e consistência das GPOs são
+  # avaliados posteriormente, quando todos os DCs já tiverem sido coletados.
+  $sysvolOverall = 'OK'
+  $sysvolReasons = @()
+
+  if ($tSysvolShare -ne 'Passed') { $sysvolOverall='Falha'; $sysvolReasons += 'Compartilhamento SYSVOL indisponível.' }
+  if ($tSysVolCheck -ne 'Passed') { $sysvolOverall='Falha'; $sysvolReasons += "DCDiag SysVolCheck: $tSysVolCheck." }
+  if ($dfsrSvc -ne 'Running') { $sysvolOverall='Falha'; $sysvolReasons += "Serviço DFSR: $dfsrSvc." }
+
+  if ($null -ne $sysvolDfsrInfo.StateNumber) {
+    if ([int]$sysvolDfsrInfo.StateNumber -eq 5) {
+      $sysvolOverall='Falha'; $sysvolReasons += 'DFSR SYSVOL Share em estado In Error (5).'
+    } elseif ([int]$sysvolDfsrInfo.StateNumber -ne 4 -and $sysvolOverall -ne 'Falha') {
+      $sysvolOverall='Aviso'; $sysvolReasons += "DFSR SYSVOL Share em estado $($sysvolDfsrInfo.StateLabel)."
+    }
+  } elseif ($sysvolOverall -eq 'OK') {
+    $sysvolOverall='Aviso'; $sysvolReasons += 'Estado operacional do DFSR não pôde ser consultado.'
+  }
+
+  if ($sysvolDfsrInfo.CriticalEventCount -gt 0) {
+    $sysvolOverall='Falha'; $sysvolReasons += "$($sysvolDfsrInfo.CriticalEventCount) evento(s) crítico(s) DFSR 2213/4012 nas últimas 24h."
+  } elseif ($tDFSREvent -ne 'Passed' -and $sysvolOverall -eq 'OK') {
+    $sysvolOverall='Aviso'; $sysvolReasons += "DCDiag DFSREvent: $tDFSREvent."
+  }
+
+  if ($sysvolGpoInfo.QueryError -and $sysvolOverall -eq 'OK') {
+    $sysvolOverall='Aviso'; $sysvolReasons += 'Não foi possível inventariar as GPOs no SYSVOL.'
+  } elseif (-not $sysvolGpoInfo.QueryError -and [int]$sysvolGpoInfo.GpoCount -eq 0 -and $sysvolOverall -eq 'OK') {
+    $sysvolOverall='Aviso'; $sysvolReasons += 'Nenhum diretório de GPO foi encontrado em SYSVOL\Policies.'
+  }
+
+  if ($sysvolReasons.Count -eq 0) { $sysvolReasons = @('Testes locais do SYSVOL/DFSR concluídos sem desvio detectado.') }
+
   [pscustomobject]@{
     Identity          = $dcFqdn
     OSCaption         = $serverInfo.OSCaption
@@ -1071,6 +1454,21 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
     TimeStratum                  = $timeInfo.Stratum
     TimeHealth                   = $timeInfo.Health
     TimeHealthDetail             = $timeInfo.HealthDetail
+    SysvolDomain                 = $dcDomainName
+    DFSRService                  = $dfsrSvc
+    SysvolDfsrState              = $sysvolDfsrInfo.StateLabel
+    SysvolDfsrStateNumber        = $sysvolDfsrInfo.StateNumber
+    SysvolContentFreshness       = $sysvolDfsrInfo.ContentFreshness
+    SysvolMaxOfflineTimeInDays   = $sysvolDfsrInfo.MaxOfflineTimeInDays
+    SysvolRecentEventCount       = $sysvolDfsrInfo.RecentEventCount
+    SysvolCriticalEventCount     = $sysvolDfsrInfo.CriticalEventCount
+    SysvolRecentEvents           = $sysvolDfsrInfo.RecentEvents
+    SysvolEventQueryError        = $sysvolDfsrInfo.EventQueryError
+    SysvolGpoCount               = $sysvolGpoInfo.GpoCount
+    SysvolGpoQueryError          = $sysvolGpoInfo.QueryError
+    SysvolGpoInventory           = $sysvolGpoInfo.Entries
+    SysvolOverall                = $sysvolOverall
+    SysvolOverallDetail          = ($sysvolReasons -join ' ')
     PingStatus                   = $pingStatus
     NetlogonService   = $netlogon
     NTDSService       = $ntds
@@ -1079,6 +1477,8 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
     ReplicationTest   = $tRepl
     ServicesTest      = $tServices
     AdvertisingTest   = $tAdvertising
+    SysVolCheckTest   = $tSysVolCheck
+    DFSREventTest     = $tDFSREvent
     NETLOGONTest      = $tNetlogonShare
     SYSVOLTest        = $tSysvolShare
     FSMOCheckTest     = $tFSMO
@@ -1112,6 +1512,130 @@ $ResultsArr = foreach ($dcFqdn in $DCServers) {
 $ResultsArr = $ResultsArr | Sort-Object Identity
 
 # ===========================
+# SYSVOL - Backlog entre parceiros e consistência de GPOs
+# ===========================
+$SysvolBacklogInfo = @()
+$backlogPairs = @{}
+
+foreach ($r in $ResultsArr) {
+  $destination = [string]$r.Identity
+  $destinationDomain = [string]$r.SysvolDomain
+  foreach ($rep in @($r.ReplicationDetails)) {
+    $source = Resolve-KnownDcName -Name ([string]$rep.Partner) -KnownDcs $DCServers
+    if (-not $source -or $source -ieq $destination) { continue }
+    if ((Resolve-DomainFromDcFqdn -DcName $source) -ine $destinationDomain) { continue }
+
+    $pairKey = "$source|$destination"
+    if (-not $backlogPairs.ContainsKey($pairKey)) {
+      $backlogPairs[$pairKey] = [pscustomobject]@{ Source=$source; Destination=$destination }
+    }
+  }
+}
+
+foreach ($pairKey in ($backlogPairs.Keys | Sort-Object)) {
+  $pair = $backlogPairs[$pairKey]
+  $SysvolBacklogInfo += Get-SysvolBacklogSafe -SourceComputerName $pair.Source -DestinationComputerName $pair.Destination
+}
+
+$SysvolGpoConsistencyIssues = @()
+$SysvolUniqueGpoCount = 0
+
+foreach ($domainGroup in ($ResultsArr | Group-Object SysvolDomain)) {
+  $domainName = [string]$domainGroup.Name
+  if ([string]::IsNullOrWhiteSpace($domainName) -or $domainName -eq 'Unknown') { continue }
+
+  $dcRows = @($domainGroup.Group)
+  # DCs cuja leitura do SYSVOL falhou são sinalizados na tabela local, mas não são
+  # tratados como se todas as GPOs estivessem ausentes, evitando falsos positivos.
+  $comparableDcRows = @($dcRows | Where-Object { -not $_.SysvolGpoQueryError })
+  $allGuids = @(
+    $comparableDcRows | ForEach-Object { @($_.SysvolGpoInventory) } | ForEach-Object { $_.Guid } |
+      Where-Object { $_ } | Sort-Object -Unique
+  )
+  $SysvolUniqueGpoCount += $allGuids.Count
+
+  # Consistência exige pelo menos dois DCs consultáveis no mesmo domínio.
+  if ($comparableDcRows.Count -lt 2) { continue }
+
+  foreach ($guid in $allGuids) {
+    $states = @()
+    $knownHashes = @()
+    $hasIssue = $false
+    $issueTypes = @()
+
+    foreach ($dcRow in $comparableDcRows) {
+      $entry = @($dcRow.SysvolGpoInventory | Where-Object { $_.Guid -eq $guid }) | Select-Object -First 1
+      $dcShort = ([string]$dcRow.Identity -split '\.')[0]
+
+      if (-not $entry) {
+        $states += "${dcShort}: GPO ausente"
+        $hasIssue = $true
+        $issueTypes += 'Diretório ausente'
+        continue
+      }
+
+      if (-not $entry.GptPresent) {
+        $states += "${dcShort}: GPT.INI ausente"
+        $hasIssue = $true
+        $issueTypes += 'GPT.INI ausente'
+        continue
+      }
+
+      $hashText = [string]$entry.GptHash
+      if ($hashText -and $hashText -notin @('Missing','HashError','Unknown')) {
+        $knownHashes += $hashText
+        $shortHash = if ($hashText.Length -gt 12) { $hashText.Substring(0,12) } else { $hashText }
+        $states += "${dcShort}: OK (v$($entry.Version), $shortHash...)"
+      } else {
+        $states += "${dcShort}: hash indisponível"
+        $hasIssue = $true
+        $issueTypes += 'Hash indisponível'
+      }
+    }
+
+    if (@($knownHashes | Sort-Object -Unique).Count -gt 1) {
+      $hasIssue = $true
+      $issueTypes += 'GPT.INI divergente'
+    }
+
+    if ($hasIssue) {
+      $SysvolGpoConsistencyIssues += [pscustomobject]@{
+        Domain = $domainName
+        GpoGuid = $guid
+        Issue = (@($issueTypes | Sort-Object -Unique) -join ', ')
+        Detail = ($states -join ' | ')
+      }
+    }
+  }
+}
+
+# Incorpora achados de backlog e consistência ao estado consolidado do SYSVOL.
+foreach ($r in $ResultsArr) {
+  $additionalReasons = @()
+
+  $pendingForDc = @(
+    $SysvolBacklogInfo | Where-Object { $_.Destination -ieq $r.Identity -and $_.Status -eq 'Aviso' }
+  )
+  if ($pendingForDc.Count -gt 0) {
+    if ($r.SysvolOverall -eq 'OK') { $r.SysvolOverall = 'Aviso' }
+    $additionalReasons += "$($pendingForDc.Count) relação(ões) de SYSVOL com backlog pendente para este DC."
+  }
+
+  $domainIssues = @(
+    $SysvolGpoConsistencyIssues | Where-Object { $_.Domain -ieq $r.SysvolDomain }
+  )
+  if ($domainIssues.Count -gt 0) {
+    if ($r.SysvolOverall -eq 'OK') { $r.SysvolOverall = 'Aviso' }
+    $additionalReasons += "$($domainIssues.Count) inconsistência(s) de GPO/GPT.INI detectada(s) no domínio."
+  }
+
+  if ($additionalReasons.Count -gt 0) {
+    $baseDetail = [string]$r.SysvolOverallDetail
+    $r.SysvolOverallDetail = (($baseDetail, ($additionalReasons -join ' ')) | Where-Object { $_ }) -join ' '
+  }
+}
+
+# ===========================
 # Exportações (CSV/JSON)
 # ===========================
 if ($ExportCsv) {
@@ -1122,7 +1646,7 @@ if ($ExportCsv) {
 }
 if ($ExportJson) {
   try {
-    $ResultsArr | ConvertTo-Json -Depth 6 | Out-File -FilePath $ExportJson -Encoding UTF8
+    $ResultsArr | ConvertTo-Json -Depth 8 | Out-File -FilePath $ExportJson -Encoding UTF8
     Write-Host "Export JSON: $((Resolve-Path -LiteralPath $ExportJson).Path)" -ForegroundColor Green
   } catch { Write-Warning "JSON: $($_.Exception.Message)" }
 }
@@ -1138,11 +1662,14 @@ $StatusProperties = @(
   'NetlogonService',
   'NTDSService',
   'DNSServiceStatus',
+  'DFSRService',
   'NetlogonsTest',
   'ReplicationTest',
   'ServicesTest',
   'AdvertisingTest',
   'FSMOCheckTest',
+  'SysVolCheckTest',
+  'DFSREventTest',
   'NETLOGONTest',
   'SYSVOLTest',
   'KerberosTCP',
@@ -1169,11 +1696,14 @@ $StatusLabels = @{
   NetlogonService  = 'Serviço Netlogon'
   NTDSService      = 'Serviço NTDS'
   DNSServiceStatus = 'Serviço DNS'
+  DFSRService      = 'Serviço DFS Replication'
   NetlogonsTest    = 'DCDiag - Netlogons'
   ReplicationTest  = 'DCDiag - Replicação'
   ServicesTest     = 'DCDiag - Services'
   AdvertisingTest  = 'DCDiag - Advertising'
   FSMOCheckTest    = 'DCDiag - FSMO Check'
+  SysVolCheckTest  = 'DCDiag - SysVolCheck'
+  DFSREventTest    = 'DCDiag - DFSREvent'
   NETLOGONTest     = 'Compartilhamento NETLOGON'
   SYSVOLTest       = 'Compartilhamento SYSVOL'
   KerberosTCP      = 'Kerberos TCP 88'
@@ -1194,8 +1724,8 @@ $StatusLabels = @{
 }
 
 $StatusCategories = @{
-  PingStatus='Conectividade'; NetlogonService='Serviços'; NTDSService='Serviços'; DNSServiceStatus='Serviços'
-  NetlogonsTest='DCDiag'; ReplicationTest='DCDiag'; ServicesTest='DCDiag'; AdvertisingTest='DCDiag'; FSMOCheckTest='DCDiag'
+  PingStatus='Conectividade'; NetlogonService='Serviços'; NTDSService='Serviços'; DNSServiceStatus='Serviços'; DFSRService='SYSVOL / DFSR'
+  NetlogonsTest='DCDiag'; ReplicationTest='DCDiag'; ServicesTest='DCDiag'; AdvertisingTest='DCDiag'; FSMOCheckTest='DCDiag'; SysVolCheckTest='SYSVOL / DFSR'; DFSREventTest='SYSVOL / DFSR'
   NETLOGONTest='Compartilhamentos'; SYSVOLTest='Compartilhamentos'
   KerberosTCP='Kerberos'; KerberosUDP='Kerberos'
   LDAPTCP='LDAP / GC'; LDAPUDP='LDAP / GC'; LDAPS='LDAP / GC'; GCLDAP='LDAP / GC'; GCLDAPS='LDAP / GC'
@@ -1209,6 +1739,8 @@ $DcDiagPropertyToTest = @{
   ServicesTest='Services'
   AdvertisingTest='Advertising'
   FSMOCheckTest='FSMOCheck'
+  SysVolCheckTest='SysVolCheck'
+  DFSREventTest='DFSREvent'
 }
 
 # Resumo geral do Health Check
@@ -1720,6 +2252,77 @@ $css = @"
   .time-table .time-source { min-width: 280px; font-family: Consolas, "Courier New", monospace; }
   .time-table .time-date { min-width: 165px; white-space: nowrap; }
   .time-table .time-center { min-width: 100px; text-align: center; white-space: nowrap; }
+
+  .sysvol-panel {
+    border-left: 4px solid #277da1;
+  }
+
+  .sysvol-panel .panel-header {
+    background: #f4f9fc;
+  }
+
+  .sysvol-table {
+    min-width: 1650px !important;
+  }
+
+  .sysvol-table thead th,
+  .sysvol-backlog-table thead th,
+  .sysvol-gpo-table thead th,
+  .sysvol-event-table thead th {
+    position: static !important;
+    background: #277da1;
+    color: #ffffff;
+    height: auto;
+  }
+
+  .sysvol-table td,
+  .sysvol-backlog-table td,
+  .sysvol-gpo-table td,
+  .sysvol-event-table td {
+    text-align: left;
+    white-space: normal;
+    line-height: 1.45;
+    vertical-align: top;
+  }
+
+  .sysvol-table .sysvol-dc { min-width: 210px; font-weight: 650; color: #24364b; }
+  .sysvol-table .sysvol-center { min-width: 105px; text-align: center; white-space: nowrap; }
+  .sysvol-table .sysvol-state { min-width: 165px; }
+  .sysvol-table .sysvol-detail { min-width: 300px; }
+
+  .sysvol-subtitle {
+    margin: 0;
+    padding: 12px 18px;
+    background: #f8fbfd;
+    border-top: 1px solid #e5eef4;
+    border-bottom: 1px solid #e5eef4;
+    color: #334155;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .sysvol-backlog-table { min-width: 1050px !important; }
+  .sysvol-backlog-table .sysvol-peer { min-width: 220px; font-weight: 650; }
+  .sysvol-backlog-table .sysvol-method { min-width: 160px; }
+  .sysvol-backlog-table .sysvol-backlog-detail { min-width: 380px; }
+
+  .sysvol-gpo-table { min-width: 1200px !important; }
+  .sysvol-gpo-table .sysvol-guid { min-width: 320px; font-family: Consolas, "Courier New", monospace; }
+  .sysvol-gpo-table .sysvol-gpo-detail { min-width: 600px; font-family: Consolas, "Courier New", monospace; }
+
+  .sysvol-event-table { min-width: 1400px !important; }
+  .sysvol-event-table .sysvol-event-dc { min-width: 210px; font-weight: 650; }
+  .sysvol-event-table .sysvol-event-message { min-width: 700px; }
+  .sysvol-event-table .sysvol-event-date { min-width: 165px; white-space: nowrap; }
+
+  .sysvol-note {
+    padding: 12px 18px;
+    background: #f7fbfd;
+    border-top: 1px solid #deebf2;
+    color: #5b6472;
+    font-size: 11px;
+    line-height: 1.55;
+  }
 
   .failure-panel {
     border-left: 4px solid #d13438;
@@ -2253,6 +2856,128 @@ $timeSection = @"
   </section>
 "@
 
+# Gera a seção dedicada de SYSVOL / DFS Replication.
+$sysvolLocalRows = foreach ($r in $ResultsArr) {
+  $dcHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.Identity)
+  $shareHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SYSVOLTest)
+  $sysvolCheckHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SysVolCheckTest)
+  $dfsrServiceHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.DFSRService)
+  $stateHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SysvolDfsrState)
+  $dfsrEventHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.DFSREventTest)
+  $freshnessHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SysvolContentFreshness)
+  $eventsHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SysvolRecentEventCount)
+  $gpoCountHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SysvolGpoCount)
+  $overallHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SysvolOverall)
+  $overallDetailHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SysvolOverallDetail)
+
+  $shareClass = Get-StatusColor -Status ([string]$r.SYSVOLTest)
+  $checkClass = Get-StatusColor -Status ([string]$r.SysVolCheckTest)
+  $serviceClass = Get-StatusColor -Status ([string]$r.DFSRService)
+  $eventClass = Get-StatusColor -Status ([string]$r.DFSREventTest)
+  $stateClass = if ($r.SysvolDfsrStateNumber -eq 4) { 'ok' } elseif ($r.SysvolDfsrStateNumber -eq 5) { 'fail' } else { 'warn' }
+  $overallClass = if ($r.SysvolOverall -eq 'OK') { 'ok' } elseif ($r.SysvolOverall -eq 'Falha') { 'fail' } else { 'warn' }
+
+  "<tr><td class='sysvol-dc'>$dcHtml</td><td class='sysvol-center'><span class='status-badge $shareClass'>$shareHtml</span></td><td class='sysvol-center'><span class='status-badge $checkClass'>$sysvolCheckHtml</span></td><td class='sysvol-center'><span class='status-badge $serviceClass'>$dfsrServiceHtml</span></td><td class='sysvol-state'><span class='status-badge $stateClass'>$stateHtml</span></td><td class='sysvol-center'><span class='status-badge $eventClass'>$dfsrEventHtml</span></td><td class='sysvol-state'>$freshnessHtml</td><td class='sysvol-center'>$eventsHtml</td><td class='sysvol-center'>$gpoCountHtml</td><td class='sysvol-detail'><span class='status-badge $overallClass'>$overallHtml</span><br/>$overallDetailHtml</td></tr>"
+}
+
+$sysvolBacklogRows = if ($SysvolBacklogInfo.Count -gt 0) {
+  foreach ($item in $SysvolBacklogInfo) {
+    $sourceHtml = [System.Net.WebUtility]::HtmlEncode([string]$item.Source)
+    $destHtml = [System.Net.WebUtility]::HtmlEncode([string]$item.Destination)
+    $countHtml = [System.Net.WebUtility]::HtmlEncode([string]$item.Count)
+    $methodHtml = [System.Net.WebUtility]::HtmlEncode([string]$item.Method)
+    $detailHtml = [System.Net.WebUtility]::HtmlEncode([string]$item.Detail)
+    $class = if ($item.Status -eq 'OK') { 'ok' } elseif ($item.Status -eq 'Aviso') { 'warn' } else { 'warn' }
+    $statusHtml = [System.Net.WebUtility]::HtmlEncode([string]$item.Status)
+    "<tr><td class='sysvol-peer'>$sourceHtml</td><td class='sysvol-peer'>$destHtml</td><td><span class='status-badge $class'>$statusHtml</span></td><td>$countHtml</td><td class='sysvol-method'>$methodHtml</td><td class='sysvol-backlog-detail'>$detailHtml</td></tr>"
+  }
+} else {
+  @("<tr><td colspan='6'>Nenhum par de parceiros elegível foi identificado para consulta de backlog.</td></tr>")
+}
+
+$sysvolGpoRows = if ($SysvolGpoConsistencyIssues.Count -gt 0) {
+  foreach ($issue in $SysvolGpoConsistencyIssues) {
+    $domainHtml = [System.Net.WebUtility]::HtmlEncode([string]$issue.Domain)
+    $guidHtml = [System.Net.WebUtility]::HtmlEncode([string]$issue.GpoGuid)
+    $issueHtml = [System.Net.WebUtility]::HtmlEncode([string]$issue.Issue)
+    $detailHtml = [System.Net.WebUtility]::HtmlEncode([string]$issue.Detail)
+    "<tr><td>$domainHtml</td><td class='sysvol-guid'>$guidHtml</td><td><span class='status-badge warn'>&#9888; $issueHtml</span></td><td class='sysvol-gpo-detail'>$detailHtml</td></tr>"
+  }
+} else {
+  @("<tr><td colspan='4'><span class='status-badge ok'>&#10003; Consistente</span> Nenhuma divergência de diretório/GPT.INI/hash foi identificada entre os DCs consultados.</td></tr>")
+}
+
+$sysvolEventRows = @()
+foreach ($r in $ResultsArr) {
+  $dcHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.Identity)
+  if ($r.SysvolEventQueryError) {
+    $queryErrorHtml = [System.Net.WebUtility]::HtmlEncode([string]$r.SysvolEventQueryError)
+    $sysvolEventRows += "<tr><td class='sysvol-event-dc'>$dcHtml</td><td><span class='status-badge warn'>&#9888; Consulta</span></td><td>Aviso</td><td class='sysvol-event-date'>-</td><td class='sysvol-event-message'>Não foi possível consultar diretamente o log DFS Replication: $queryErrorHtml</td></tr>"
+  }
+  foreach ($evt in @($r.SysvolRecentEvents)) {
+    $idHtml = [System.Net.WebUtility]::HtmlEncode([string]$evt.Id)
+    $levelHtml = [System.Net.WebUtility]::HtmlEncode([string]$evt.Level)
+    $dateHtml = [System.Net.WebUtility]::HtmlEncode([string]$evt.Time)
+    $messageHtml = [System.Net.WebUtility]::HtmlEncode([string]$evt.Message)
+    $evtClass = if ($evt.IsCritical) { 'fail' } elseif ($evt.Level -match '(?i)warn|aviso|error|erro') { 'warn' } else { 'ok' }
+    $sysvolEventRows += "<tr><td class='sysvol-event-dc'>$dcHtml</td><td><span class='status-badge $evtClass'>$idHtml</span></td><td>$levelHtml</td><td class='sysvol-event-date'>$dateHtml</td><td class='sysvol-event-message'>$messageHtml</td></tr>"
+  }
+}
+if ($sysvolEventRows.Count -eq 0) {
+  $sysvolEventRows = @("<tr><td colspan='5'><span class='status-badge ok'>&#10003; Sem eventos relevantes</span> Nenhum evento DFSR relevante foi retornado nas últimas 24 horas.</td></tr>")
+}
+
+$sysvolHealthyCount = @($ResultsArr | Where-Object { $_.SysvolOverall -eq 'OK' }).Count
+$sysvolWarnCount = @($ResultsArr | Where-Object { $_.SysvolOverall -eq 'Aviso' }).Count
+$sysvolFailCount = @($ResultsArr | Where-Object { $_.SysvolOverall -eq 'Falha' }).Count
+$sysvolBacklogWarnCount = @($SysvolBacklogInfo | Where-Object { $_.Status -eq 'Aviso' }).Count
+
+$sysvolSection = @"
+  <section class='panel sysvol-panel'>
+    <div class='panel-header'>
+      <h2 class='panel-title'>Integridade do SYSVOL / DFS Replication</h2>
+      <div class='legend'>
+        <span class='legend-badge ok'>$sysvolHealthyCount DCs OK</span>
+        <span class='legend-badge warn'>$sysvolWarnCount avisos</span>
+        <span class='legend-badge fail'>$sysvolFailCount falhas</span>
+      </div>
+    </div>
+
+    <div class='table-scroll'>
+      <table class='sysvol-table'>
+        <thead><tr><th>Domain Controller</th><th>SYSVOL Share</th><th>SysVolCheck</th><th>DFSR</th><th>DFSR State</th><th>DFSREvent</th><th>Content Freshness</th><th>Eventos relevantes 24h</th><th>GPOs</th><th>Resultado SYSVOL</th></tr></thead>
+        <tbody>$($sysvolLocalRows -join "`n")</tbody>
+      </table>
+    </div>
+
+    <h3 class='sysvol-subtitle'>Backlog de Replicação do SYSVOL</h3>
+    <div class='table-scroll'>
+      <table class='sysvol-backlog-table'>
+        <thead><tr><th>Origem</th><th>Destino</th><th>Estado</th><th>Backlog</th><th>Método</th><th>Detalhes</th></tr></thead>
+        <tbody>$($sysvolBacklogRows -join "`n")</tbody>
+      </table>
+    </div>
+
+    <h3 class='sysvol-subtitle'>Consistência das GPOs no SYSVOL</h3>
+    <div class='table-scroll'>
+      <table class='sysvol-gpo-table'>
+        <thead><tr><th>Domínio</th><th>GUID da GPO</th><th>Inconsistência</th><th>Estado por Domain Controller</th></tr></thead>
+        <tbody>$($sysvolGpoRows -join "`n")</tbody>
+      </table>
+    </div>
+
+    <h3 class='sysvol-subtitle'>Eventos DFS Replication relevantes - últimas 24 horas</h3>
+    <div class='table-scroll'>
+      <table class='sysvol-event-table'>
+        <thead><tr><th>Domain Controller</th><th>Event ID</th><th>Nível</th><th>Data/Hora</th><th>Mensagem</th></tr></thead>
+        <tbody>$($sysvolEventRows -join "`n")</tbody>
+      </table>
+    </div>
+
+    <div class='sysvol-note'><b>Critérios:</b> State 4 do DfsrReplicatedFolderInfo representa estado Normal. Eventos 2213 e 4012 são tratados como críticos. Backlog maior que zero é exibido como aviso, pois backlog representa latência e não significa necessariamente falha. A consistência das GPOs compara, por domínio, a presença do diretório GUID, a existência do GPT.INI e o SHA256 do GPT.INI em cada DC. Total de GPOs únicas inventariadas: $SysvolUniqueGpoCount. Pares com backlog pendente: $sysvolBacklogWarnCount.</div>
+  </section>
+"@
+
 # Gera a seção visual de falhas identificadas.
 if ($FailureItems.Count -gt 0) {
   $failureRows = foreach ($failure in $FailureItems) {
@@ -2372,6 +3097,8 @@ $htmlHeader = @"
 
   $networkSection
 
+  $sysvolSection
+
   $replicationSection
 
   $timeSection
@@ -2393,8 +3120,8 @@ $htmlHeader = @"
         <thead>
           <tr class='group-row'>
             <th class='group-identity identity-head' rowspan='2'>Domain Controller</th>
-            <th class='group-service' colspan='4'>Conectividade e Serviços</th>
-            <th class='group-dcdiag' colspan='5'>DCDiag</th>
+            <th class='group-service' colspan='5'>Conectividade e Serviços</th>
+            <th class='group-dcdiag' colspan='7'>DCDiag</th>
             <th class='group-share' colspan='2'>Compartilhamentos</th>
             <th class='group-kerberos' colspan='2'>Kerberos</th>
             <th class='group-ldap' colspan='5'>LDAP / Global Catalog</th>
@@ -2406,12 +3133,15 @@ $htmlHeader = @"
             <th>Netlogon</th>
             <th>NTDS</th>
             <th>DNS Service</th>
+            <th>DFSR</th>
 
             <th>Netlogons</th>
             <th>Replication</th>
             <th>Services</th>
             <th>Advertising</th>
             <th>FSMO Check</th>
+            <th>SysVolCheck</th>
+            <th>DFSREvent</th>
 
             <th>NETLOGON</th>
             <th>SYSVOL</th>
