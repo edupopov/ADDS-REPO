@@ -1,6 +1,9 @@
 <# 
 AD Health Check – PS 5.1/7 – Layout v8
+- Atualizado em 08-2026
 - Criado por Eduardo Popovici e disponível em seu repositório GitHub
+- Este script nasceu da ideia de facilitar o troubleshooting de quem administra ambientes de domínio
+- Também útil para quem trabalha em consultorias e precisa de uma forma fácil de coletar os dados
 - Script criado e disponibilizado para a comunidade Microsoft
 - Ping via ping.exe
 - Port checks: Kerberos (88 TCP/UDP), LDAP (389 TCP/UDP), LDAPS (636 TCP), GC (3268/3269 TCP), NTLM (135/139/445 TCP), DNS (53 TCP/UDP)
